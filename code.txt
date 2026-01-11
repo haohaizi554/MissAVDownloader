@@ -1,0 +1,3879 @@
+com/missav/bot/bot/MissavBot.java
+package com.missav.bot.bot;
+
+import com.missav.bot.crawler.CrawlResult;
+import com.missav.bot.push.service.IPushService;
+import com.missav.bot.subscription.entity.Subscription;
+import com.missav.bot.subscription.entity.Subscription.SubscriptionType;
+import com.missav.bot.telegram.TelegramMessageService;
+import com.missav.bot.video.entity.Video;
+import com.missav.bot.video.mapper.VideoMapper;
+import com.missav.bot.subscription.service.ISubscriptionService;
+import com.missav.bot.crawler.service.ICrawlerService;
+import jakarta.annotation.PostConstruct;
+import lombok.extern.slf4j.Slf4j;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import org.telegram.telegrambots.bots.DefaultBotOptions;
+import org.telegram.telegrambots.bots.TelegramLongPollingBot;
+import org.telegram.telegrambots.meta.api.methods.commands.SetMyCommands;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
+import org.telegram.telegrambots.meta.api.methods.send.SendVideo;
+import org.telegram.telegrambots.meta.api.objects.InputFile;
+import org.telegram.telegrambots.meta.api.objects.Message;
+import org.telegram.telegrambots.meta.api.objects.Update;
+import org.telegram.telegrambots.meta.api.objects.commands.BotCommand;
+import org.telegram.telegrambots.meta.api.objects.commands.scope.BotCommandScopeDefault;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+
+import java.util.*;
+
+
+@Slf4j
+@Component
+public class MissavBot extends TelegramLongPollingBot {
+    super(getProxyOptions(), botToken);
+    private final ISubscriptionService subscriptionService;
+    private final VideoMapper videoMapper;
+    private final ICrawlerService crawlerService;
+    private final IPushService pushService;
+    private final TelegramMessageService telegramMessageService;
+
+    @Value("${telegram.bot.token}")
+    private String botToken;
+
+    @Value("${telegram.bot.username:MissavBot}")
+    private String botUsername;
+
+    public MissavBot(ISubscriptionService subscriptionService, VideoMapper videoMapper,
+                     ICrawlerService crawlerService, IPushService pushService,
+                     TelegramMessageService telegramMessageService) {
+        super(createBotOptions());
+        this.subscriptionService = subscriptionService;
+        this.videoMapper = videoMapper;
+        this.crawlerService = crawlerService;
+        this.pushService = pushService;
+        this.telegramMessageService = telegramMessageService;
+
+        // 设置 TelegramMessageService 的 bot 实例
+        this.telegramMessageService.setBot(this);
+    }
+
+    private static DefaultBotOptions createBotOptions() {
+        DefaultBotOptions options = new DefaultBotOptions();
+        options.setProxyHost("127.0.0.1");
+        options.setProxyPort(7890);
+        options.setProxyType(DefaultBotOptions.ProxyType.HTTP);
+        options.setGetUpdatesTimeout(75);  // 增加轮询超时到 75 秒
+        options.setMaxThreads(1);  // 减少线程数
+        return options;
+    }
+
+    @PostConstruct
+    public void setupCommands() {
+        try {
+            List<BotCommand> commands = new ArrayList<>();
+            commands.add(new BotCommand("start", "开始使用"));
+            commands.add(new BotCommand("help", "查看帮助"));
+            commands.add(new BotCommand("subscribe", "订阅新片"));
+            commands.add(new BotCommand("unsubscribe", "取消订阅"));
+            commands.add(new BotCommand("list", "我的订阅"));
+            commands.add(new BotCommand("latest", "最新视频"));
+            commands.add(new BotCommand("search", "搜索视频"));
+            commands.add(new BotCommand("status", "机器人状态"));
+
+            execute(new SetMyCommands(commands, new BotCommandScopeDefault(), null));
+            log.info("Bot 命令菜单设置成功");
+        } catch (TelegramApiException e) {
+            log.error("设置 Bot 命令菜单失败", e);
+        }
+    }
+
+    @Override
+    public String getBotToken() {
+        return botToken;
+    }
+
+    @Override
+    public String getBotUsername() {
+        return botUsername;
+    }
+
+    @Override
+    public void onUpdateReceived(Update update) {
+        if (!update.hasMessage() || !update.getMessage().hasText()) {
+            return;
+        }
+
+        Message message = update.getMessage();
+        String text = message.getText().trim();
+        Long chatId = message.getChatId();
+        String chatType = message.getChat().getType();
+
+        log.info("收到消息: chatId={}, type={}, text={}", chatId, chatType, text);
+
+        // 自动为新群组创建订阅（仅群组/超级群组，不包括私聊）
+        // 跳过 /subscribe 命令，避免与手动订阅冲突
+        if (("group".equals(chatType) || "supergroup".equals(chatType)) &&
+            text.startsWith("/") && !text.toLowerCase().startsWith("/subscribe")) {
+            try {
+                List<Subscription> existingSubs = subscriptionService.getSubscriptions(chatId);
+                if (existingSubs.isEmpty()) {
+                    subscriptionService.subscribe(chatId, chatType, SubscriptionType.ALL, null);
+                    log.info("自动订阅新群组: chatId={}, type={}, title={}",
+                        chatId, chatType, message.getChat().getTitle());
+                }
+            } catch (Exception e) {
+                log.debug("自动订阅群组失败: chatId={}, error={}", chatId, e.getMessage());
+            }
+        }
+
+        try {
+            if (text.startsWith("/")) {
+                handleCommand(chatId, chatType, text);
+            }
+        } catch (Exception e) {
+            log.error("处理消息失败", e);
+            sendText(chatId, "❌ 处理失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 处理命令
+     */
+    private void handleCommand(Long chatId, String chatType, String text) {
+        String[] parts = text.split("\\s+", 2);
+        String command = parts[0].toLowerCase().replace("@" + botUsername.toLowerCase(), "");
+        String args = parts.length > 1 ? parts[1].trim() : "";
+
+        switch (command) {
+            case "/start", "/help" -> sendHelp(chatId);
+            case "/subscribe" -> handleSubscribe(chatId, chatType, args);
+            case "/unsubscribe" -> handleUnsubscribe(chatId, args);
+            case "/list" -> handleList(chatId);
+            case "/search" -> handleSearch(chatId, args);
+            case "/latest" -> handleLatest(chatId, args);
+            case "/crawl" -> handleCrawl(chatId, chatType, args);
+            case "/status" -> handleStatus(chatId);
+            default -> sendText(chatId, "❓ 未知命令，输入 /help 查看帮助");
+        }
+    }
+
+    /**
+     * 发送帮助信息
+     */
+    private void sendHelp(Long chatId) {
+        String help = """
+            🎬 *MissAV 机器人*
+
+            📌 *订阅命令*
+            /subscribe - 订阅全部新片
+            /subscribe 演员名 - 订阅指定演员
+            /subscribe #标签 - 订阅指定标签
+
+            📌 *管理命令*
+            /unsubscribe - 取消全部订阅
+            /unsubscribe 演员名 - 取消演员订阅
+            /list - 查看我的订阅
+
+            📌 *查询命令*
+            /search 关键词 - 搜索视频
+            /latest - 查看最新视频
+            /status - 查看机器人状态
+
+            📌 *手动爬取命令*
+            /crawl actor 演员名 [数量]
+              示例: /crawl actor 三上悠亚 10
+            /crawl code 番号
+              示例: /crawl code SSIS-001
+            /crawl search 关键词 [数量]
+              示例: /crawl search SSIS 20
+
+            💡 有新视频时会自动推送到本群
+            """;
+        telegramMessageService.sendMarkdown(chatId, help);
+    }
+
+    /**
+     * 处理订阅
+     */
+    private void handleSubscribe(Long chatId, String chatType, String args) {
+        if (args.isEmpty()) {
+            // 订阅全部
+            subscriptionService.subscribe(chatId, chatType, SubscriptionType.ALL, null);
+            sendText(chatId, "✅ 已订阅全部新片，有新视频会自动推送");
+        } else if (args.startsWith("#")) {
+            // 订阅标签
+            String tag = args.substring(1).trim();
+            subscriptionService.subscribe(chatId, chatType, SubscriptionType.TAG, tag);
+            sendText(chatId, "✅ 已订阅标签: #" + tag);
+        } else {
+            // 订阅演员
+            subscriptionService.subscribe(chatId, chatType, SubscriptionType.ACTRESS, args);
+            sendText(chatId, "✅ 已订阅演员: " + args);
+        }
+    }
+
+    /**
+     * 处理取消订阅
+     */
+    private void handleUnsubscribe(Long chatId, String args) {
+        if (args.isEmpty()) {
+            subscriptionService.unsubscribeAll(chatId);
+            sendText(chatId, "✅ 已取消全部订阅");
+        } else if (args.startsWith("#")) {
+            String tag = args.substring(1).trim();
+            subscriptionService.unsubscribe(chatId, SubscriptionType.TAG, tag);
+            sendText(chatId, "✅ 已取消标签订阅: #" + tag);
+        } else {
+            subscriptionService.unsubscribe(chatId, SubscriptionType.ACTRESS, args);
+            sendText(chatId, "✅ 已取消演员订阅: " + args);
+        }
+    }
+
+    /**
+     * 查看订阅列表
+     */
+    private void handleList(Long chatId) {
+        List<Subscription> subscriptions = subscriptionService.getSubscriptions(chatId);
+        if (subscriptions.isEmpty()) {
+            sendText(chatId, "📭 暂无订阅，使用 /subscribe 添加订阅");
+            return;
+        }
+
+        StringBuilder sb = new StringBuilder("📋 *当前订阅列表* (共 " + subscriptions.size() + " 个)\n\n");
+        for (Subscription sub : subscriptions) {
+            switch (sub.getType()) {
+                case ALL -> sb.append("• 全部新片 (所有视频都会推送)\n");
+                case ACTRESS -> sb.append("• 演员: ").append(sub.getKeyword()).append("\n");
+                case TAG -> sb.append("• 标签: #").append(sub.getKeyword()).append("\n");
+            }
+        }
+        sb.append("\n💡 使用 /unsubscribe 取消订阅");
+        telegramMessageService.sendMarkdown(chatId, sb.toString());
+    }
+
+    /**
+     * 搜索视频
+     */
+    private void handleSearch(Long chatId, String keyword) {
+        if (keyword.isEmpty()) {
+            sendText(chatId, "请输入搜索关键词，例如: /search SSIS");
+            return;
+        }
+
+        List<Video> videos = videoMapper.selectByActress(keyword);
+        if (videos.isEmpty()) {
+            videos = videoMapper.selectByTag(keyword);
+        }
+
+        if (videos.isEmpty()) {
+            sendText(chatId, "🔍 未找到相关视频");
+            return;
+        }
+
+        StringBuilder sb = new StringBuilder("🔍 *搜索结果*\n\n");
+        int count = 0;
+        for (Video video : videos) {
+            if (count >= 10) break;
+            sb.append("• ").append(video.getCode())
+              .append(" - ").append(truncate(video.getTitle(), 30))
+              .append("\n");
+            count++;
+        }
+        if (videos.size() > 10) {
+            sb.append("\n...共 ").append(videos.size()).append(" 个结果");
+        }
+        telegramMessageService.sendMarkdown(chatId, sb.toString());
+    }
+
+    /**
+     * 查看最新视频
+     */
+    private void handleLatest(Long chatId, String args) {
+        int page = 1;
+        if (!args.isEmpty()) {
+            try {
+                page = Integer.parseInt(args);
+                if (page < 1) page = 1;
+            } catch (NumberFormatException e) {
+                page = 1;
+            }
+        }
+
+        List<Video> videos = videoMapper.selectTop50ByCreatedTimeDesc();
+        if (videos.isEmpty()) {
+            sendText(chatId, "暂无视频");
+            return;
+        }
+
+        int pageSize = 5;
+        int totalPages = (int) Math.ceil(videos.size() / (double) pageSize);
+        int startIndex = (page - 1) * pageSize;
+        int endIndex = Math.min(startIndex + pageSize, videos.size());
+
+        if (startIndex >= videos.size()) {
+            sendText(chatId, "❌ 页码超出范围,共 " + totalPages + " 页");
+            return;
+        }
+
+        sendText(chatId, String.format("📺 最新视频 (第 %d/%d 页):", page, totalPages));
+
+        for (int i = startIndex; i < endIndex; i++) {
+            Video video = videos.get(i);
+
+            // 为每个视频发送带封面的消息
+            String caption = telegramMessageService.formatVideoMessage(video);
+
+            if (video.getCoverUrl() != null && !video.getCoverUrl().isEmpty()) {
+                telegramMessageService.sendPhotoWithCaption(chatId, video.getCoverUrl(), caption);
+            } else {
+                telegramMessageService.sendMarkdown(chatId, caption);
+            }
+
+            // 避免发送过快
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        // 提示翻页
+        if (page < totalPages) {
+            sendText(chatId, "💡 查看下一页: /latest " + (page + 1));
+        }
+    }
+
+    /**
+     * 查看状态
+     */
+    private void handleStatus(Long chatId) {
+        long videoCount = videoMapper.selectCount(null);
+        String status = String.format("""
+            🤖 *机器人状态*
+
+            📊 视频库: %d 个
+            ⏰ 检查间隔: 15 分钟
+            ✅ 运行正常
+            """, videoCount);
+        telegramMessageService.sendMarkdown(chatId, status);
+    }
+
+    /**
+     * 处理手动爬取命令
+     */
+    private void handleCrawl(Long chatId, String chatType, String args) {
+        if (args.isEmpty()) {
+            sendText(chatId, """
+                ❓ 请指定爬取方式:
+
+                /crawl actor 演员名 [数量]
+                /crawl code 番号
+                /crawl search 关键词 [数量]
+
+                示例:
+                /crawl actor 三上悠亚 10
+                /crawl code SSIS-001
+                /crawl search SSIS 20
+                """);
+            return;
+        }
+
+        String[] parts = args.split("\\s+", 3);
+        String crawlType = parts[0].toLowerCase();
+
+        try {
+            switch (crawlType) {
+                case "actor", "actress" -> handleCrawlByActor(chatId, chatType, parts);
+                case "code" -> handleCrawlByCode(chatId, parts);
+                case "search", "keyword" -> handleCrawlBySearch(chatId, chatType, parts);
+                default -> sendText(chatId, "❌ 未知的爬取类型，请使用: actor、code 或 search");
+            }
+        } catch (Exception e) {
+            log.error("爬取失败", e);
+            sendText(chatId, "❌ 爬取失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 按演员爬取
+     */
+    private void handleCrawlByActor(Long chatId, String chatType, String[] parts) {
+        // 安全检查：仅允许私聊使用
+        if (!"private".equals(chatType)) {
+            sendText(chatId, "⚠️ 为保护隐私安全，演员爬取功能仅支持私聊使用");
+            return;
+        }
+
+        if (parts.length < 2) {
+            sendText(chatId, "❌ 请指定演员名，例如: /crawl actor 三上悠亚 10");
+            return;
+        }
+
+        String actorName = parts[1];
+        Integer limit = null;
+
+        if (parts.length >= 3) {
+            try {
+                limit = Integer.parseInt(parts[2]);
+            } catch (NumberFormatException e) {
+                sendText(chatId, "❌ 数量必须是数字");
+                return;
+            }
+        }
+
+        sendText(chatId, String.format("⏳ 正在爬取演员「%s」的作品...", actorName));
+
+        // 创建 final 变量供 lambda 使用
+        final Integer finalLimit = limit;
+        final ICrawlerService service = this.crawlerService;
+
+        // 异步执行爬取，避免阻塞
+        new Thread(() -> {
+            try {
+                CrawlResult result = service.crawlByActor(actorName, finalLimit);
+
+                if (result.getNewVideos().isEmpty()) {
+                    // 显示详细结果
+                    if (result.getTotalCrawled() == 0) {
+                        sendText(chatId, String.format("🔍 未找到演员「%s」的作品", actorName));
+                    } else {
+                        sendText(chatId, String.format("📊 爬取完成，但全部为重复视频\n" +
+                            "总计: %d | 新增: 0 | 重复: %d",
+                            result.getTotalCrawled(), result.getDuplicateCount()));
+                    }
+                    return;
+                }
+
+                // 显示详细结果
+                sendText(chatId, String.format("✅ 爬取完成\n" +
+                    "📊 总计: %d | 🆕 新增: %d | 🔄 重复: %d",
+                    result.getTotalCrawled(), result.getNewCount(), result.getDuplicateCount()));
+
+                // 推送每个新视频给触发者
+                for (Video video : result.getNewVideos()) {
+                    pushService.pushVideoToChat(video, chatId);
+                    Thread.sleep(1000);
+                }
+            } catch (Exception e) {
+                log.error("爬取演员作品失败", e);
+                sendText(chatId, "❌ 爬取失败：" + e.getMessage());
+            }
+        }).start();
+    }
+
+    /**
+     * 按番号爬取
+     */
+    private void handleCrawlByCode(Long chatId, String[] parts) {
+        if (parts.length < 2) {
+            sendText(chatId, "❌ 请指定番号，例如: /crawl code SSIS-001");
+            return;
+        }
+
+        String code = parts[1].toUpperCase();
+        sendText(chatId, String.format("⏳ 正在爬取番号「%s」...", code));
+
+        // 创建 final 变量供 lambda 使用
+        final ICrawlerService service = this.crawlerService;
+
+        // 异步执行爬取
+        new Thread(() -> {
+            try {
+                Video video = service.crawlByCode(code);
+
+                if (video == null) {
+                    sendText(chatId, String.format("🔍 未找到番号「%s」", code));
+                    return;
+                }
+
+                sendText(chatId, "✅ 爬取成功");
+                pushService.pushVideoToChat(video, chatId);
+            } catch (Exception e) {
+                log.error("爬取番号失败", e);
+                sendText(chatId, "❌ 爬取失败：" + e.getMessage());
+            }
+        }).start();
+    }
+
+    /**
+     * 按关键词搜索爬取
+     */
+    private void handleCrawlBySearch(Long chatId, String chatType, String[] parts) {
+        // 安全检查：仅允许私聊使用
+        if (!"private".equals(chatType)) {
+            sendText(chatId, "⚠️ 为保护隐私安全，关键词搜索功能仅支持私聊使用");
+            return;
+        }
+
+        if (parts.length < 2) {
+            sendText(chatId, "❌ 请指定关键词，例如: /crawl search SSIS 20");
+            return;
+        }
+
+        String keyword = parts[1];
+        Integer limit = null;
+
+        if (parts.length >= 3) {
+            try {
+                limit = Integer.parseInt(parts[2]);
+            } catch (NumberFormatException e) {
+                sendText(chatId, "❌ 数量必须是数字");
+                return;
+            }
+        }
+
+        sendText(chatId, String.format("⏳ 正在搜索「%s」...", keyword));
+
+        // 创建 final 变量供 lambda 使用
+        final Integer finalLimit = limit;
+        final ICrawlerService service = this.crawlerService;
+
+        // 异步执行爬取
+        new Thread(() -> {
+            try {
+                CrawlResult result = service.crawlByKeyword(keyword, finalLimit);
+
+                if (result.getNewVideos().isEmpty()) {
+                    // 显示详细结果
+                    if (result.getTotalCrawled() == 0) {
+                        sendText(chatId, String.format("🔍 未找到关键词「%s」相关的作品", keyword));
+                    } else {
+                        sendText(chatId, String.format("📊 搜索完成，但全部为重复视频\n" +
+                            "总计: %d | 新增: 0 | 重复: %d",
+                            result.getTotalCrawled(), result.getDuplicateCount()));
+                    }
+                    return;
+                }
+
+                // 显示详细结果
+                sendText(chatId, String.format("✅ 搜索完成\n" +
+                    "📊 总计: %d | 🆕 新增: %d | 🔄 重复: %d",
+                    result.getTotalCrawled(), result.getNewCount(), result.getDuplicateCount()));
+
+                // 推送每个新视频给触发者
+                for (Video video : result.getNewVideos()) {
+                    pushService.pushVideoToChat(video, chatId);
+                    Thread.sleep(1000);
+                }
+            } catch (Exception e) {
+                log.error("搜索爬取失败", e);
+                sendText(chatId, "❌ 爬取失败：" + e.getMessage());
+            }
+        }).start();
+    }
+
+    /**
+     * 推送视频到聊天
+     */
+    public boolean pushVideo(Long chatId, Video video) {
+        try {
+            String caption = telegramMessageService.formatVideoMessage(video);
+
+            // 优先发送预览视频
+            if (video.getPreviewUrl() != null && !video.getPreviewUrl().isEmpty()) {
+                return telegramMessageService.sendVideoWithCaption(chatId, video.getPreviewUrl(), video.getCoverUrl(), caption);
+            }
+
+            // 其次发送封面图
+            if (video.getCoverUrl() != null && !video.getCoverUrl().isEmpty()) {
+                return telegramMessageService.sendPhotoWithCaption(chatId, video.getCoverUrl(), caption);
+            }
+
+            // 最后发送纯文本
+            telegramMessageService.sendMarkdown(chatId, caption);
+            return true;
+        } catch (Exception e) {
+            log.error("推送视频失败: chatId={}, code={}", chatId, video.getCode(), e);
+            return false;
+        }
+    }
+
+
+    private void sendText(Long chatId, String text) {
+        try {
+            SendMessage message = new SendMessage();
+            message.setChatId(chatId.toString());
+            message.setText(text);
+            execute(message);
+        } catch (TelegramApiException e) {
+            log.error("发送消息失败", e);
+        }
+    }
+
+    private String truncate(String text, int maxLength) {
+        if (text == null) return "";
+        return text.length() <= maxLength ? text : text.substring(0, maxLength) + "...";
+    }
+}
+
+
+com/missav/bot/common/config/BotConfig.java
+package com.missav.bot.common.config;
+
+import com.missav.bot.bot.MissavBot;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.telegram.telegrambots.meta.TelegramBotsApi;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+import org.telegram.telegrambots.updatesreceivers.DefaultBotSession;
+
+@Slf4j
+@Configuration
+public class BotConfig {
+
+    @Bean
+    public TelegramBotsApi telegramBotsApi(MissavBot missavBot) throws TelegramApiException {
+        TelegramBotsApi botsApi = new TelegramBotsApi(DefaultBotSession.class);
+        try {
+            botsApi.registerBot(missavBot);
+            log.info("Telegram Bot 注册成功");
+        } catch (TelegramApiException e) {
+            log.error("Telegram Bot 注册失败", e);
+            throw e;
+        }
+        return botsApi;
+    }
+}
+
+
+
+com/missav/bot/common/config/MyMetaObjectHandler.java
+package com.missav.bot.common.config;
+
+import com.baomidou.mybatisplus.core.handlers.MetaObjectHandler;
+import org.apache.ibatis.reflection.MetaObject;
+import org.springframework.stereotype.Component;
+
+import java.time.LocalDateTime;
+
+/**
+ * MyBatis-Plus 自动填充处理器
+ */
+@Component
+public class MyMetaObjectHandler implements MetaObjectHandler {
+
+    @Override
+    public void insertFill(MetaObject metaObject) {
+        this.strictInsertFill(metaObject, "createdTime", LocalDateTime.class, LocalDateTime.now());
+    }
+
+    @Override
+    public void updateFill(MetaObject metaObject) {
+        this.strictUpdateFill(metaObject, "updatedTime", LocalDateTime.class, LocalDateTime.now());
+    }
+}
+
+
+
+com/missav/bot/common/entity/BaseEntity.java
+package com.missav.bot.common.entity;
+
+import com.baomidou.mybatisplus.annotation.FieldFill;
+import com.baomidou.mybatisplus.annotation.TableField;
+import lombok.Data;
+
+import java.io.Serializable;
+import java.time.LocalDateTime;
+
+/**
+ * 基础实体类，包含公共字段
+ */
+@Data
+public abstract class BaseEntity implements Serializable {
+
+    /**
+     * 创建人ID
+     */
+    @TableField(fill = FieldFill.INSERT)
+    private String createdId;
+
+    /**
+     * 创建人姓名
+     */
+    @TableField(fill = FieldFill.INSERT)
+    private String createdName;
+
+    /**
+     * 创建时间
+     */
+    @TableField(fill = FieldFill.INSERT)
+    private LocalDateTime createdTime;
+
+    /**
+     * 更新人ID
+     */
+    @TableField(fill = FieldFill.UPDATE)
+    private String updatedId;
+
+    /**
+     * 更新人姓名
+     */
+    @TableField(fill = FieldFill.UPDATE)
+    private String updatedName;
+
+    /**
+     * 更新时间
+     */
+    @TableField(fill = FieldFill.UPDATE)
+    private LocalDateTime updatedTime;
+
+    /**
+     * 备注
+     */
+    private String remark;
+}
+
+
+
+com/missav/bot/common/exception/GlobalExceptionHandler.java
+package com.missav.bot.common.exception;
+
+import com.missav.bot.common.Result;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+/**
+ * 全局异常处理器
+ */
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    /**
+     * 处理参数异常
+     */
+    @ExceptionHandler(IllegalArgumentException.class)
+    public Result<Void> handleIllegalArgumentException(IllegalArgumentException e) {
+        log.error("参数异常: {}", e.getMessage());
+        return Result.error(400, e.getMessage());
+    }
+
+    /**
+     * 处理空指针异常
+     */
+    @ExceptionHandler(NullPointerException.class)
+    public Result<Void> handleNullPointerException(NullPointerException e) {
+        log.error("空指针异常", e);
+        return Result.error(500, "系统内部错误");
+    }
+
+    /**
+     * 处理运行时异常
+     */
+    @ExceptionHandler(RuntimeException.class)
+    public Result<Void> handleRuntimeException(RuntimeException e) {
+        log.error("运行时异常", e);
+        return Result.error(500, e.getMessage());
+    }
+
+    /**
+     * 处理静态资源未找到异常（降级为DEBUG，避免日志污染）
+     */
+    @ExceptionHandler(org.springframework.web.servlet.resource.NoResourceFoundException.class)
+    public void handleNoResourceFound(org.springframework.web.servlet.resource.NoResourceFoundException e) {
+        log.debug("静态资源未找到: {}", e.getResourcePath());
+    }
+
+    /**
+     * 处理文件上传解析异常（降级为DEBUG，避免日志污染）
+     */
+    @ExceptionHandler(org.springframework.web.multipart.MultipartException.class)
+    public void handleMultipartException(org.springframework.web.multipart.MultipartException e) {
+        log.debug("文件上传解析失败（通常是 Telegram 发送的非文本消息）: {}", e.getMessage());
+    }
+
+    /**
+     * 处理通用异常
+     */
+    @ExceptionHandler(Exception.class)
+    public Result<Void> handleException(Exception e) {
+        log.error("系统异常", e);
+        return Result.error(500, "系统内部错误");
+    }
+}
+
+
+
+com/missav/bot/common/Result.java
+package com.missav.bot.common.exception;
+
+import com.missav.bot.common.Result;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+/**
+ * 全局异常处理器
+ */
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    /**
+     * 处理参数异常
+     */
+    @ExceptionHandler(IllegalArgumentException.class)
+    public Result<Void> handleIllegalArgumentException(IllegalArgumentException e) {
+        log.error("参数异常: {}", e.getMessage());
+        return Result.error(400, e.getMessage());
+    }
+
+    /**
+     * 处理空指针异常
+     */
+    @ExceptionHandler(NullPointerException.class)
+    public Result<Void> handleNullPointerException(NullPointerException e) {
+        log.error("空指针异常", e);
+        return Result.error(500, "系统内部错误");
+    }
+
+    /**
+     * 处理运行时异常
+     */
+    @ExceptionHandler(RuntimeException.class)
+    public Result<Void> handleRuntimeException(RuntimeException e) {
+        log.error("运行时异常", e);
+        return Result.error(500, e.getMessage());
+    }
+
+    /**
+     * 处理静态资源未找到异常（降级为DEBUG，避免日志污染）
+     */
+    @ExceptionHandler(org.springframework.web.servlet.resource.NoResourceFoundException.class)
+    public void handleNoResourceFound(org.springframework.web.servlet.resource.NoResourceFoundException e) {
+        log.debug("静态资源未找到: {}", e.getResourcePath());
+    }
+
+    /**
+     * 处理文件上传解析异常（降级为DEBUG，避免日志污染）
+     */
+    @ExceptionHandler(org.springframework.web.multipart.MultipartException.class)
+    public void handleMultipartException(org.springframework.web.multipart.MultipartException e) {
+        log.debug("文件上传解析失败（通常是 Telegram 发送的非文本消息）: {}", e.getMessage());
+    }
+
+    /**
+     * 处理通用异常
+     */
+    @ExceptionHandler(Exception.class)
+    public Result<Void> handleException(Exception e) {
+        log.error("系统异常", e);
+        return Result.error(500, "系统内部错误");
+    }
+}
+
+
+
+com/missav/bot/crawler/service/impl/CrawlerServiceImpl.java
+package com.missav.bot.crawler.service.impl;
+
+import com.missav.bot.crawler.CrawlResult;
+import com.missav.bot.crawler.MissavCrawler;
+import com.missav.bot.crawler.service.ICrawlerService;
+import com.missav.bot.video.entity.Video;
+import com.missav.bot.video.mapper.VideoMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class CrawlerServiceImpl implements ICrawlerService {
+
+    private final MissavCrawler crawler;
+    private final VideoMapper videoMapper;
+
+    @Override
+    @Transactional
+    public List<Video> crawlAndSaveNewVideos() {
+        return crawlAndSaveNewVideos(1);
+    }
+
+    @Override
+    @Transactional
+    public List<Video> crawlAndSaveNewVideos(int pages) {
+        List<Video> crawledVideos = crawler.crawlNewVideos(pages);
+        List<Video> newVideos = new ArrayList<>();
+        int duplicateCount = 0;
+        int invalidCount = 0;
+
+        log.debug("开始处理爬取到的 {} 个视频", crawledVideos.size());
+
+        // 过滤无效视频
+        List<Video> validVideos = new ArrayList<>();
+        for (Video video : crawledVideos) {
+            if (video.getCode() == null) {
+                invalidCount++;
+                log.debug("跳过无效视频（无番号）: {}", video.getTitle());
+            } else {
+                validVideos.add(video);
+            }
+        }
+
+        if (validVideos.isEmpty()) {
+            log.debug("没有有效视频需要处理");
+            log.info("本次抓取完成 - 总计: {}, 新增: 0, 重复: 0, 无效: {}",
+                crawledVideos.size(), invalidCount);
+            return newVideos;
+        }
+
+        // 批量检查重复
+        List<String> codes = validVideos.stream().map(Video::getCode).toList();
+        List<String> existingCodes = videoMapper.selectExistingCodes(codes);
+        java.util.Set<String> existingCodeSet = new java.util.HashSet<>(existingCodes);
+        duplicateCount = existingCodes.size();
+
+        // 过滤出新视频
+        for (Video video : validVideos) {
+            if (existingCodeSet.contains(video.getCode())) {
+                log.debug("视频已存在，跳过: {}", video.getCode());
+            } else {
+                newVideos.add(video);
+            }
+        }
+
+        if (newVideos.isEmpty()) {
+            log.info("本次抓取完成 - 总计: {}, 新增: 0, 重复: {}, 无效: {}",
+                crawledVideos.size(), duplicateCount, invalidCount);
+            return newVideos;
+        }
+
+        // 补充详情信息（如需要）
+        for (Video video : newVideos) {
+            if (video.getDetailUrl() != null &&
+                (video.getActresses() == null || video.getPreviewUrl() == null)) {
+                try {
+                    Video detail = crawler.crawlVideoDetail(video.getDetailUrl());
+                    if (detail != null) {
+                        mergeVideoInfo(video, detail);
+                    }
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            video.setPushed(false);
+        }
+
+        // 批量插入
+        int actualInserted = 0;
+        List<Video> insertedVideos = new ArrayList<>();
+        for (Video video : newVideos) {
+            try {
+                videoMapper.insert(video);
+                log.info("新视频入库: {} - {}", video.getCode(), video.getTitle());
+                insertedVideos.add(video);
+                actualInserted++;
+            } catch (org.springframework.dao.DuplicateKeyException e) {
+                log.warn("视频已存在，跳过: {}", video.getCode());
+                duplicateCount++;
+            }
+        }
+
+        log.info("本次抓取完成 - 总计: {}, 新增: {}, 重复: {}, 无效: {}",
+            crawledVideos.size(), actualInserted, duplicateCount, invalidCount);
+
+        return insertedVideos;
+    }
+
+    private void mergeVideoInfo(Video target, Video source) {
+        if (source.getActresses() != null && target.getActresses() == null) {
+            target.setActresses(source.getActresses());
+        }
+        if (source.getTags() != null && target.getTags() == null) {
+            target.setTags(source.getTags());
+        }
+        if (source.getCoverUrl() != null && target.getCoverUrl() == null) {
+            target.setCoverUrl(source.getCoverUrl());
+        }
+        if (source.getPreviewUrl() != null && target.getPreviewUrl() == null) {
+            target.setPreviewUrl(source.getPreviewUrl());
+        }
+        if (source.getDuration() != null && target.getDuration() == null) {
+            target.setDuration(source.getDuration());
+        }
+        if (source.getTitle() != null && target.getTitle() == null) {
+            target.setTitle(source.getTitle());
+        }
+    }
+
+    @Override
+    public List<Video> getUnpushedVideos() {
+        return videoMapper.selectUnpushedVideos();
+    }
+
+    @Override
+    @Transactional
+    public void markAsPushed(Long videoId) {
+        Video video = videoMapper.selectById(videoId);
+        if (video != null) {
+            video.setPushed(true);
+            videoMapper.updateById(video);
+        }
+    }
+
+    @Override
+    @Transactional
+    public CrawlResult crawlByActor(String actorName, Integer limit) {
+        log.debug("开始按演员爬取: {}, 限制: {}", actorName, limit);
+        List<Video> crawledVideos = crawler.crawlByActor(actorName, limit);
+        return saveAndReturnResult(crawledVideos);
+    }
+
+    @Override
+    @Transactional
+    public Video crawlByCode(String code) {
+        log.debug("开始按番号爬取: {}", code);
+
+        // 先检查数据库是否已存在
+        if (videoMapper.existsByCode(code)) {
+            log.debug("番号 {} 已存在于数据库", code);
+            return videoMapper.selectByCode(code);
+        }
+
+        Video video = crawler.crawlByCode(code);
+        if (video == null) {
+            log.warn("未找到番号: {}", code);
+            return null;
+        }
+
+        video.setPushed(false);
+        videoMapper.insert(video);
+        log.info("新视频入库: {} - {}", video.getCode(), video.getTitle());
+
+        return video;
+    }
+
+    @Override
+    @Transactional
+    public CrawlResult crawlByKeyword(String keyword, Integer limit) {
+        log.debug("开始按关键词搜索: {}, 限制: {}", keyword, limit);
+        List<Video> crawledVideos = crawler.crawlByKeyword(keyword, limit);
+        return saveAndReturnResult(crawledVideos);
+    }
+
+    /**
+     * 保存爬取的视频并返回爬取结果（去重）
+     */
+    private CrawlResult saveAndReturnResult(List<Video> crawledVideos) {
+        List<Video> newVideos = new ArrayList<>();
+        int duplicateCount = 0;
+        int invalidCount = 0;
+
+        log.debug("开始处理爬取到的 {} 个视频", crawledVideos.size());
+
+        // 过滤无效视频
+        List<Video> validVideos = new ArrayList<>();
+        for (Video video : crawledVideos) {
+            if (video.getCode() == null) {
+                invalidCount++;
+                log.debug("跳过无效视频（无番号）: {}", video.getTitle());
+            } else {
+                validVideos.add(video);
+            }
+        }
+
+        if (validVideos.isEmpty()) {
+            log.debug("没有有效视频需要处理");
+            return new CrawlResult(newVideos, crawledVideos.size(), duplicateCount, invalidCount);
+        }
+
+        // 批量检查重复
+        List<String> codes = validVideos.stream().map(Video::getCode).toList();
+        List<String> existingCodes = videoMapper.selectExistingCodes(codes);
+        java.util.Set<String> existingCodeSet = new java.util.HashSet<>(existingCodes);
+        duplicateCount = existingCodes.size();
+
+        // 过滤出新视频
+        for (Video video : validVideos) {
+            if (existingCodeSet.contains(video.getCode())) {
+                log.debug("视频已存在，跳过: {}", video.getCode());
+            } else {
+                newVideos.add(video);
+            }
+        }
+
+        if (newVideos.isEmpty()) {
+            log.info("本次抓取完成 - 总计: {}, 新增: 0, 重复: {}, 无效: {}",
+                crawledVideos.size(), duplicateCount, invalidCount);
+            return new CrawlResult(newVideos, crawledVideos.size(), duplicateCount, invalidCount);
+        }
+
+        // 补充详情信息（如需要）
+        for (Video video : newVideos) {
+            if (video.getDetailUrl() != null &&
+                (video.getActresses() == null || video.getPreviewUrl() == null)) {
+                try {
+                    Video detail = crawler.crawlVideoDetail(video.getDetailUrl());
+                    if (detail != null) {
+                        mergeVideoInfo(video, detail);
+                    }
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            video.setPushed(false);
+        }
+
+        // 批量插入
+        int actualInserted = 0;
+        List<Video> insertedVideos = new ArrayList<>();
+        for (Video video : newVideos) {
+            try {
+                videoMapper.insert(video);
+                log.info("新视频入库: {} - {}", video.getCode(), video.getTitle());
+                insertedVideos.add(video);
+                actualInserted++;
+            } catch (org.springframework.dao.DuplicateKeyException e) {
+                log.warn("视频已存在，跳过: {}", video.getCode());
+                duplicateCount++;
+            }
+        }
+
+        log.info("本次抓取完成 - 总计: {}, 新增: {}, 重复: {}, 无效: {}",
+            crawledVideos.size(), actualInserted, duplicateCount, invalidCount);
+
+        return new CrawlResult(insertedVideos, crawledVideos.size(), duplicateCount, invalidCount);
+    }
+}
+
+
+
+com/missav/bot/crawler/service/ICrawlerService.java
+package com.missav.bot.crawler.service;
+
+import com.missav.bot.crawler.CrawlResult;
+import com.missav.bot.video.entity.Video;
+
+import java.util.List;
+
+/**
+ * 爬虫服务接口
+ */
+public interface ICrawlerService {
+
+    /**
+     * 抓取并保存新视频
+     * @return 新增的视频列表
+     */
+    List<Video> crawlAndSaveNewVideos();
+
+    /**
+     * 抓取并保存指定页数的新视频
+     * @param pages 页数
+     * @return 新增的视频列表
+     */
+    List<Video> crawlAndSaveNewVideos(int pages);
+
+    /**
+     * 获取未推送的视频
+     * @return 未推送的视频列表
+     */
+    List<Video> getUnpushedVideos();
+
+    /**
+     * 标记视频为已推送
+     * @param videoId 视频ID
+     */
+    void markAsPushed(Long videoId);
+
+    /**
+     * 按演员名爬取作品
+     * @param actorName 演员名
+     * @param limit 限制数量，null 表示全部
+     * @return 爬取结果（包含新增、重复、总数等信息）
+     */
+    CrawlResult crawlByActor(String actorName, Integer limit);
+
+    /**
+     * 按番号爬取作品
+     * @param code 番号
+     * @return 爬取的视频，不存在返回 null
+     */
+    Video crawlByCode(String code);
+
+    /**
+     * 按关键词搜索爬取
+     * @param keyword 关键词
+     * @param limit 限制数量，null 表示全部
+     * @return 爬取结果（包含新增、重复、总数等信息）
+     */
+    CrawlResult crawlByKeyword(String keyword, Integer limit);
+}
+
+
+
+com/missav/bot/crawler/CrawlResult.java
+package com.missav.bot.crawler;
+
+import com.missav.bot.video.entity.Video;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.List;
+
+/**
+ * 爬取结果
+ */
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class CrawlResult {
+    /**
+     * 新增的视频列表
+     */
+    private List<Video> newVideos;
+
+    /**
+     * 爬取总数
+     */
+    private int totalCrawled;
+
+    /**
+     * 重复数量
+     */
+    private int duplicateCount;
+
+    /**
+     * 无效数量（无番号）
+     */
+    private int invalidCount;
+
+    /**
+     * 获取新增数量
+     */
+    public int getNewCount() {
+        return newVideos != null ? newVideos.size() : 0;
+    }
+}
+
+
+
+com/missav/bot/crawler/MissavCrawler.java
+package com.missav.bot.crawler;
+
+import com.missav.bot.video.entity.Video;
+import io.github.bonigarcia.wdm.WebDriverManager;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.*;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
+import org.openqa.selenium.By;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.WebElement;
+import org.openqa.selenium.chrome.ChromeDriver;
+import org.openqa.selenium.chrome.ChromeOptions;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.WebDriverWait;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Slf4j
+@Component
+public class MissavCrawler {
+
+    private static final String BASE_URL = "https://missav.ai";
+    private static final String NEW_VIDEOS_URL = BASE_URL + "/new";
+
+    private static final Pattern CODE_PATTERN = Pattern.compile("([A-Z]+-\\d+)", Pattern.CASE_INSENSITIVE);
+    private static final Pattern DURATION_PATTERN = Pattern.compile("(\\d+)\\s*分");
+
+    private final OkHttpClient httpClient;
+    private final Map<String, List<Cookie>> cookieStore = new HashMap<>();
+    private volatile LocalDateTime cookieInitTime = null;  // Cookie 初始化时间
+    private static final Duration COOKIE_EXPIRE_DURATION = Duration.ofMinutes(10);  // Cookie 有效期10分钟
+
+    @Value("${crawler.user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36}")
+    private String userAgent;
+
+    public MissavCrawler() {
+        this.httpClient = new OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .writeTimeout(30, TimeUnit.SECONDS)
+                .followRedirects(true)
+                .cookieJar(new CookieJar() {
+                    @Override
+                    public void saveFromResponse(HttpUrl url, List<Cookie> cookies) {
+                        cookieStore.put(url.host(), cookies);
+                    }
+
+                    @Override
+                    public List<Cookie> loadForRequest(HttpUrl url) {
+                        List<Cookie> cookies = cookieStore.get(url.host());
+                        return cookies != null ? cookies : new ArrayList<>();
+                    }
+                })
+                .build();
+    }
+
+    /**
+     * 初始化 Cookie - 多次请求建立会话
+     */
+    private void initCookies() {
+        // 检查 Cookie 是否需要刷新
+        boolean needRefresh = cookieStore.isEmpty()
+                || cookieInitTime == null
+                || Duration.between(cookieInitTime, LocalDateTime.now()).compareTo(COOKIE_EXPIRE_DURATION) > 0;
+
+        if (!needRefresh) {
+            log.debug("Cookie 仍然有效，跳过初始化（已使用 {} 分钟）",
+                Duration.between(cookieInitTime, LocalDateTime.now()).toMinutes());
+            return;
+        }
+
+        try {
+            if (cookieStore.isEmpty()) {
+                log.info("初始化 Cookie（预热会话）...");
+            } else {
+                log.info("Cookie 已过期，重新初始化（上次初始化: {}）", cookieInitTime);
+                cookieStore.clear();  // 清除过期 Cookie
+            }
+
+            // 网站需要多次请求才能建立有效会话，进行 2-3 次预热请求
+            for (int i = 1; i <= 3; i++) {
+                fetchHtml(NEW_VIDEOS_URL + "?page=2");
+                if (i < 3) {
+                    Thread.sleep(1000); // 请求间隔 1 秒
+                }
+            }
+
+            cookieInitTime = LocalDateTime.now();  // 记录初始化时间
+            log.info("Cookie 初始化完成");
+        } catch (Exception e) {
+            log.warn("Cookie 初始化失败", e);
+        }
+    }
+
+    /**
+     * 抓取最新视频列表
+     */
+    public List<Video> crawlNewVideos() {
+        return crawlNewVideos(1);
+    }
+
+    /**
+     * 抓取指定页数的最新视频
+     */
+    public List<Video> crawlNewVideos(int pages) {
+        List<Video> videos = new ArrayList<>();
+
+        initCookies();
+
+        for (int page = 1; page <= pages; page++) {
+            try {
+                String url = page == 1 ? NEW_VIDEOS_URL : NEW_VIDEOS_URL + "?page=" + page;
+                log.info("正在抓取: {}", url);
+
+                String html = fetchHtml(url);
+                if (html == null) {
+                    log.warn("获取页面失败: {}", url);
+                    continue;
+                }
+
+                List<Video> pageVideos = parseVideoList(html);
+                videos.addAll(pageVideos);
+                log.info("第{}页抓取到{}个视频", page, pageVideos.size());
+
+                // 避免请求过于频繁
+                if (page < pages) {
+                    Thread.sleep(2000);
+                }
+            } catch (Exception e) {
+                log.error("抓取第{}页失败", page, e);
+            }
+        }
+
+        return videos;
+    }
+
+    /**
+     * 抓取视频详情
+     */
+    public Video crawlVideoDetail(String detailUrl) {
+        try {
+            log.info("正在抓取视频详情: {}", detailUrl);
+            String html = fetchHtml(detailUrl);
+            if (html == null) {
+                log.warn("HTTP 请求失败，降级使用 Selenium");
+                return crawlVideoDetailWithSelenium(detailUrl);
+            }
+            return parseVideoDetail(html, detailUrl);
+        } catch (Exception e) {
+            log.error("抓取视频详情失败: {}", detailUrl, e);
+            return null;
+        }
+    }
+
+    /**
+     * 使用 Selenium 抓取视频详情
+     */
+    private Video crawlVideoDetailWithSelenium(String url) {
+        WebDriver driver = null;
+        try {
+            WebDriverManager.chromedriver().setup();
+
+            ChromeOptions options = new ChromeOptions();
+            options.addArguments("--headless=new");
+            options.addArguments("--no-sandbox");
+            options.addArguments("--disable-dev-shm-usage");
+            options.addArguments("--disable-gpu");
+            options.addArguments("--user-agent=" + userAgent);
+
+            driver = new ChromeDriver(options);
+            driver.get(url);
+
+            WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(15));
+            wait.until(ExpectedConditions.presenceOfElementLocated(By.tagName("body")));
+            Thread.sleep(2000);
+
+            String renderedHtml = driver.getPageSource();
+            return parseVideoDetail(renderedHtml, url);
+
+        } catch (Exception e) {
+            log.error("Selenium 抓取视频详情失败: {}", url, e);
+            return null;
+        } finally {
+            if (driver != null) {
+                driver.quit();
+            }
+        }
+    }
+
+    private String fetchHtml(String url) {
+        // 添加随机延迟，避免请求过快
+        try {
+            Thread.sleep(1000 + (long)(Math.random() * 2000)); // 1-3秒随机延迟
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        Request request = new Request.Builder()
+                .url(url)
+                .header("User-Agent", userAgent)
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7")
+                // 删除 Accept-Encoding，让 OkHttp 自动处理压缩
+                .header("Referer", "https://missav.ai/")
+                .header("Connection", "keep-alive")
+                .header("Cache-Control", "max-age=0")
+                .build();
+
+        try (Response response = httpClient.newCall(request).execute()) {
+            log.debug("HTTP 响应状态: {} - {}", response.code(), response.message());
+            log.debug("最终 URL (重定向后): {}", response.request().url());
+
+            if (!response.isSuccessful()) {
+                log.warn("请求失败: {} - {}", url, response.code());
+                return null;
+            }
+
+            String html = response.body() != null ? response.body().string() : null;
+            if (html != null) {
+                log.debug("HTML 长度: {} 字符", html.length());
+                log.debug("HTML 前500字符: {}", html.substring(0, Math.min(500, html.length())));
+            } else {
+                log.warn("响应体为空");
+            }
+
+            return html;
+        } catch (IOException e) {
+            log.error("请求异常: {}", url, e);
+            return null;
+        }
+    }
+
+    /**
+     * 解析视频列表页
+     */
+    private List<Video> parseVideoList(String html) {
+        List<Video> videos = new ArrayList<>();
+        Document doc = Jsoup.parse(html);
+
+        log.info("页面标题: {}", doc.title());
+
+        // 首先尝试从 script 标签中提取 JSON 数据（处理客户端渲染）
+        log.info("开始尝试 JSON 提取...");
+        List<Video> jsonVideos = extractVideosFromJson(doc);
+        if (!jsonVideos.isEmpty()) {
+            log.info("✓ JSON 提取成功，获得 {} 个视频", jsonVideos.size());
+            return jsonVideos;
+        }
+
+        // 降级方案：使用传统 HTML 解析
+        log.info("✗ JSON 提取失败（返回 0 个视频），降级到 HTML 解析");
+        log.info("页面包含的主要 div 类: {}", doc.select("div[class]").stream()
+            .limit(10)
+            .map(e -> e.className())
+            .distinct()
+            .toList());
+
+        // 尝试多种选择器
+        Elements videoCards = doc.select("div.video-card, article.video, div[class*=thumbnail]");
+        log.info("选择器1匹配到 {} 个元素", videoCards.size());
+
+        if (videoCards.isEmpty()) {
+            videoCards = doc.select("div.group");
+            log.info("选择器2(div.group)匹配到 {} 个元素", videoCards.size());
+        }
+
+        if (videoCards.isEmpty()) {
+            videoCards = doc.select("a[href*='/']");
+            log.info("选择器3(a[href])匹配到 {} 个元素", videoCards.size());
+
+            if (!videoCards.isEmpty()) {
+                videoCards = videoCards.stream()
+                    .filter(e -> {
+                        String href = e.attr("href");
+                        return href != null && CODE_PATTERN.matcher(href).find();
+                    })
+                    .collect(Elements::new, Elements::add, Elements::addAll);
+                log.info("过滤后包含番号的链接: {} 个", videoCards.size());
+            }
+        }
+
+        log.info("最终使用的选择器匹配到 {} 个视频卡片", videoCards.size());
+
+        if (videoCards.isEmpty()) {
+            log.warn("未找到任何视频卡片，输出HTML前1000字符用于调试:");
+            log.warn(html.substring(0, Math.min(1000, html.length())));
+        }
+
+        for (Element card : videoCards) {
+            try {
+                Video video = parseVideoCard(card);
+                if (video != null && video.getCode() != null) {
+                    videos.add(video);
+                } else {
+                    log.warn("解析视频卡片失败，未提取到番号。元素HTML: {}",
+                        card.html().substring(0, Math.min(500, card.html().length())));
+                    if (video != null) {
+                        log.warn("提取到的信息: title={}, detailUrl={}, code={}",
+                            video.getTitle(), video.getDetailUrl(), video.getCode());
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("解析视频卡片异常", e);
+            }
+        }
+
+        return videos;
+    }
+
+    /**
+     * 使用 Selenium 提取客户端渲染的视频列表
+     */
+    private List<Video> extractVideosWithSelenium(String url) {
+        log.warn("========== 启动无头浏览器提取视频数据 ==========");
+        WebDriver driver = null;
+        try {
+            WebDriverManager.chromedriver().setup();
+
+            ChromeOptions options = new ChromeOptions();
+            options.addArguments("--headless=new");
+            options.addArguments("--no-sandbox");
+            options.addArguments("--disable-dev-shm-usage");
+            options.addArguments("--disable-gpu");
+            options.addArguments("--user-agent=" + userAgent);
+
+            driver = new ChromeDriver(options);
+            driver.get(url);
+
+            log.info("等待页面加载完成...");
+            WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(15));
+            wait.until(ExpectedConditions.presenceOfElementLocated(By.cssSelector("div.group")));
+
+            Thread.sleep(3000);
+
+            log.info("提取渲染后的 HTML");
+            String renderedHtml = driver.getPageSource();
+            Document doc = Jsoup.parse(renderedHtml);
+
+            List<Video> videos = new ArrayList<>();
+            Elements videoCards = doc.select("div.group");
+            log.info("Selenium 提取到 {} 个视频卡片", videoCards.size());
+
+            if (!videoCards.isEmpty()) {
+                log.warn("========== 第一个视频卡片的 HTML（用于调试）==========");
+                log.warn(videoCards.first().html().substring(0, Math.min(1000, videoCards.first().html().length())));
+                log.warn("========== 第一个视频卡片的 HTML 结束 ==========");
+            }
+
+            for (Element card : videoCards) {
+                try {
+                    Video video = new Video();
+
+                    Element link = card.selectFirst("a[href]");
+                    if (link != null) {
+                        String href = link.attr("href");
+                        if (href != null && !href.isEmpty() && !href.equals("#") && !href.equals("javascript:;")) {
+                            video.setDetailUrl(href.startsWith("http") ? href : BASE_URL + href);
+                            String code = extractCode(href);
+                            if (code == null) {
+                                code = extractCodeFromUrl(href);
+                            }
+                            video.setCode(code);
+                        }
+                    }
+
+                    Element img = card.selectFirst("img[src], img[data-src]");
+                    if (img != null) {
+                        String coverUrl = extractImageUrl(img);
+                        if (coverUrl != null && !coverUrl.isEmpty()) {
+                            video.setCoverUrl(coverUrl);
+                        }
+                    }
+
+                    if (video.getCode() != null) {
+                        videos.add(video);
+                    }
+                } catch (Exception e) {
+                    log.warn("解析视频卡片异常", e);
+                }
+            }
+
+            log.warn("✓ Selenium 提取完成，获得 {} 个视频", videos.size());
+            return videos;
+
+        } catch (Exception e) {
+            log.error("Selenium 提取失败", e);
+            return new ArrayList<>();
+        } finally {
+            if (driver != null) {
+                driver.quit();
+            }
+            log.warn("========== 无头浏览器已关闭 ==========");
+        }
+    }
+
+    /**
+     * 解析视频卡片
+     */
+    private Video parseVideoCard(Element card) {
+        Video video = new Video();
+
+        // 提取链接
+        Element link = card.selectFirst("a[href*=missav]");
+        if (link == null) {
+            link = card.selectFirst("a");
+        }
+        if (link != null) {
+            video.setDetailUrl(link.attr("abs:href"));
+        }
+
+        // 提取标题
+        Element titleEl = card.selectFirst("h3, h4, .title, [class*=title]");
+        if (titleEl != null) {
+            video.setTitle(titleEl.text().trim());
+        }
+
+        // 从标题或链接中提取番号
+        String code = extractCode(video.getTitle());
+        if (code == null && video.getDetailUrl() != null) {
+            code = extractCode(video.getDetailUrl());
+        }
+
+        // 如果仍然没有提取到番号，尝试从URL路径中提取作为备用标识
+        if (code == null && video.getDetailUrl() != null) {
+            code = extractCodeFromUrl(video.getDetailUrl());
+        }
+        video.setCode(code);
+
+        // 提取封面图
+        Element img = card.selectFirst("img");
+        if (img != null) {
+            String coverUrl = extractImageUrl(img);
+            if (coverUrl != null && !coverUrl.isEmpty()) {
+                video.setCoverUrl(coverUrl);
+            }
+        }
+
+        // 提取时长
+        Element durationEl = card.selectFirst(".duration, [class*=duration], span:contains(分)");
+        if (durationEl != null) {
+            video.setDuration(extractDuration(durationEl.text()));
+        }
+
+        return video;
+    }
+
+    /**
+     * 解析视频详情页
+     */
+    private Video parseVideoDetail(String html, String detailUrl) {
+        Document doc = Jsoup.parse(html);
+        Video video = new Video();
+        video.setDetailUrl(detailUrl);
+
+        // 提取标题
+        Element titleEl = doc.selectFirst("h1, .video-title, [class*=title]");
+        if (titleEl != null) {
+            video.setTitle(titleEl.text().trim());
+        }
+
+        // 提取番号
+        video.setCode(extractCode(video.getTitle()));
+        if (video.getCode() == null) {
+            video.setCode(extractCode(detailUrl));
+        }
+
+        // 提取演员
+        Elements actressEls = doc.select("a[href*=actress], a[href*=actor], .actress");
+        if (!actressEls.isEmpty()) {
+            List<String> actresses = new ArrayList<>();
+            for (Element el : actressEls) {
+                actresses.add(el.text().trim());
+            }
+            video.setActresses(String.join(", ", actresses));
+        }
+
+        // 提取标签
+        Elements tagEls = doc.select("a[href*=tag], a[href*=genre], .tag");
+        if (!tagEls.isEmpty()) {
+            List<String> tags = new ArrayList<>();
+            for (Element el : tagEls) {
+                tags.add(el.text().trim());
+            }
+            video.setTags(String.join(", ", tags));
+        }
+
+        // 提取封面图
+        Element coverEl = doc.selectFirst("meta[property=og:image], img.cover, .video-cover img");
+        if (coverEl != null) {
+            video.setCoverUrl(coverEl.attr("content"));
+            if (video.getCoverUrl().isEmpty()) {
+                video.setCoverUrl(coverEl.attr("src"));
+            }
+        }
+
+        // 提取预览视频 - 尝试多种方式
+        Element videoEl = doc.selectFirst("video");
+        if (videoEl != null) {
+            // 尝试从video标签的各种属性中获取
+            String previewUrl = videoEl.attr("data-src");
+            if (previewUrl.isEmpty()) previewUrl = videoEl.attr("src");
+            if (previewUrl.isEmpty()) {
+                Element source = videoEl.selectFirst("source");
+                if (source != null) {
+                    previewUrl = source.attr("src");
+                    if (previewUrl.isEmpty()) previewUrl = source.attr("data-src");
+                }
+            }
+            if (!previewUrl.isEmpty()) {
+                video.setPreviewUrl(previewUrl);
+            }
+        }
+
+        // 如果还是没找到,尝试从script标签中提取
+        if (video.getPreviewUrl() == null || video.getPreviewUrl().isEmpty()) {
+            Elements scripts = doc.select("script");
+            for (Element script : scripts) {
+                String scriptText = script.html();
+                if (scriptText.contains(".mp4") || scriptText.contains("preview")) {
+                    // 尝试提取URL模式
+                    int start = scriptText.indexOf("https://");
+                    if (start != -1) {
+                        int end = scriptText.indexOf(".mp4", start);
+                        if (end != -1) {
+                            String url = scriptText.substring(start, end + 4);
+                            video.setPreviewUrl(url);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 提取时长
+        Element durationEl = doc.selectFirst(".duration, [class*=duration], span:contains(分钟)");
+        if (durationEl != null) {
+            video.setDuration(extractDuration(durationEl.text()));
+        }
+
+        return video;
+    }
+
+    /**
+     * 按演员名爬取作品
+     */
+    public List<Video> crawlByActor(String actorName, Integer limit) {
+        List<Video> videos = new ArrayList<>();
+        int page = 1;
+        // 假设每页平均 12 个视频，计算需要的最大页数（向上取整并多爬1页以确保足够）
+        int maxPages = limit != null ? ((limit + 11) / 12 + 1) : Integer.MAX_VALUE;
+
+        try {
+            initCookies();
+            String encodedName = URLEncoder.encode(actorName, StandardCharsets.UTF_8);
+            while (page <= maxPages) {
+                String url = BASE_URL + "/actresses/" + encodedName + (page > 1 ? "?page=" + page : "");
+                log.info("正在抓取演员作品: {}", url);
+
+                String html = fetchHtml(url);
+                if (html == null) {
+                    break;
+                }
+
+                List<Video> pageVideos = parseVideoList(html);
+                if (pageVideos.isEmpty()) {
+                    break;
+                }
+
+                videos.addAll(pageVideos);
+                log.info("演员 {} 第{}页抓取到{}个视频，当前总数: {}", actorName, page, pageVideos.size(), videos.size());
+
+                if (limit != null && videos.size() >= limit) {
+                    videos = videos.subList(0, limit);
+                    log.info("已达到限制数量 {}，停止抓取", limit);
+                    break;
+                }
+
+                page++;
+                Thread.sleep(2000);
+            }
+        } catch (Exception e) {
+            log.error("抓取演员 {} 的作品失败", actorName, e);
+        }
+
+        log.info("演员作品抓取完成，共抓取 {} 个视频", videos.size());
+        return videos;
+    }
+
+    /**
+     * 按番号爬取作品
+     */
+    public Video crawlByCode(String code) {
+        try {
+            // MissAV 的番号详情页 URL 格式通常是 /番号
+            String url = BASE_URL + "/" + code;
+            log.info("正在按番号爬取: {}", url);
+
+            String html = fetchHtml(url);
+            if (html == null) {
+                return null;
+            }
+
+            Video video = parseVideoDetail(html, url);
+            if (video != null && video.getCode() == null) {
+                video.setCode(code.toUpperCase());
+            }
+
+            return video;
+        } catch (Exception e) {
+            log.error("按番号 {} 爬取失败", code, e);
+            return null;
+        }
+    }
+
+    /**
+     * 按关键词搜索爬取
+     */
+    public List<Video> crawlByKeyword(String keyword, Integer limit) {
+        List<Video> videos = new ArrayList<>();
+        int page = 1;
+        int maxPages = limit != null ? ((limit + 11) / 12 + 1) : Integer.MAX_VALUE;
+
+        try {
+            initCookies();
+            String encodedKeyword = URLEncoder.encode(keyword, StandardCharsets.UTF_8);
+            while (page <= maxPages) {
+                String url = BASE_URL + "/search/" + encodedKeyword + (page > 1 ? "?page=" + page : "");
+                log.info("正在搜索关键词: {}", url);
+
+                String html = fetchHtml(url);
+                if (html == null) {
+                    break;
+                }
+
+                List<Video> pageVideos = parseVideoList(html);
+
+                // 如果第一页解析失败，尝试使用 Selenium
+                if (pageVideos.isEmpty() && page == 1) {
+                    log.warn("第一页 HTML 解析失败，尝试使用 Selenium 无头浏览器");
+                    pageVideos = extractVideosWithSelenium(url);
+                }
+
+                if (pageVideos.isEmpty()) {
+                    break;
+                }
+
+                videos.addAll(pageVideos);
+                log.info("关键词 {} 第{}页抓取到{}个视频，当前总数: {}", keyword, page, pageVideos.size(), videos.size());
+
+                if (limit != null && videos.size() >= limit) {
+                    videos = videos.subList(0, limit);
+                    log.info("已达到限制数量 {}，停止抓取", limit);
+                    break;
+                }
+
+                page++;
+                Thread.sleep(2000);
+            }
+        } catch (Exception e) {
+            log.error("搜索关键词 {} 失败", keyword, e);
+        }
+
+        log.info("关键词搜索完成，共抓取 {} 个视频", videos.size());
+        return videos;
+    }
+
+    /**
+     * 从 img 元素中提取真实的图片 URL
+     * 尝试多个可能的属性，过滤掉 base64 占位符
+     */
+    private String extractImageUrl(Element img) {
+        if (img == null) {
+            return null;
+        }
+
+        // 按优先级尝试多个属性
+        String[] attributes = {"data-original", "data-lazy-src", "data-src", "srcset", "src"};
+
+        for (String attr : attributes) {
+            String url = img.attr(attr);
+            if (url != null && !url.isEmpty() && !url.startsWith("data:")) {
+                // 如果是 srcset，取第一个 URL
+                if (attr.equals("srcset") && url.contains(" ")) {
+                    url = url.split("\\s+")[0];
+                }
+                // 验证是否为有效的 HTTP/HTTPS URL
+                if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("/")) {
+                    return url;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * 从文本中提取番号
+     */
+    private String extractCode(String text) {
+        if (text == null || text.isEmpty()) {
+            return null;
+        }
+        Matcher matcher = CODE_PATTERN.matcher(text);
+        if (matcher.find()) {
+            return matcher.group(1).toUpperCase();
+        }
+        return null;
+    }
+
+    /**
+     * 从URL路径中提取标识符作为备用番号
+     * 例如: https://missav.ai/xxx/yyy/zzz → zzz
+     */
+    private String extractCodeFromUrl(String url) {
+        if (url == null || url.isEmpty()) {
+            return null;
+        }
+        try {
+            // 移除查询参数和锚点
+            String path = url.split("\\?")[0].split("#")[0];
+            // 移除末尾的斜杠
+            if (path.endsWith("/")) {
+                path = path.substring(0, path.length() - 1);
+            }
+            // 提取最后一段路径
+            String[] parts = path.split("/");
+            if (parts.length > 0) {
+                String lastPart = parts[parts.length - 1];
+                // 如果最后一段不为空，使用它作为标识符
+                if (!lastPart.isEmpty()) {
+                    log.debug("从URL提取备用标识符: {} -> {}", url, lastPart);
+                    return lastPart.toUpperCase();
+                }
+            }
+        } catch (Exception e) {
+            log.warn("从URL提取标识符失败: {}", url, e);
+        }
+        return null;
+    }
+
+    /**
+     * 从页面 script 标签中提取 JSON 数据（处理客户端渲染页面）
+     */
+    private List<Video> extractVideosFromJson(Document doc) {
+        List<Video> videos = new ArrayList<>();
+
+        // 查找所有 script 标签
+        Elements scripts = doc.select("script");
+        log.info("找到 {} 个 script 标签", scripts.size());
+
+        int scriptIndex = 0;
+        Element obfuscatedScript = null;
+        int obfuscatedScriptIndex = -1;
+
+        for (Element script : scripts) {
+            String scriptContent = script.html();
+            scriptIndex++;
+
+            // 检测混淆代码（eval + function packing）
+            boolean isObfuscated = scriptContent.contains("eval(function(p,a,c,k,e,d)");
+            boolean hasVideoData = scriptContent.contains("dvd_id") || scriptContent.contains("uuid");
+
+            // 输出 script 信息
+            if (scriptContent.length() > 0) {
+                String prefix = isObfuscated ? "【混淆代码】" : "";
+                log.info("{}Script #{} (长度: {} 字符) 前200字符: {}",
+                    prefix,
+                    scriptIndex,
+                    scriptContent.length(),
+                    scriptContent.substring(0, Math.min(200, scriptContent.length())));
+
+                // 如果是混淆代码且长度超过3000字符，保存引用（可能包含视频数据）
+                if (isObfuscated && scriptContent.length() > 3000) {
+                    obfuscatedScript = script;
+                    obfuscatedScriptIndex = scriptIndex;
+                    log.warn("检测到大型混淆代码 Script #{}，稍后输出完整内容", scriptIndex);
+                }
+            } else {
+                log.info("Script #{} 为空", scriptIndex);
+            }
+
+            // 查找可能包含视频数据的 JSON
+            if (hasVideoData) {
+                log.info("发现可能包含视频数据的 script 标签（长度: {} 字符）", scriptContent.length());
+
+                try {
+                    // 尝试提取 JSON 数据
+                    // 模式1: window.xxx = {...}
+                    String jsonPattern1 = "window\\.[\\w_]+\\s*=\\s*(\\{.*?\\});?$";
+                    java.util.regex.Pattern p1 = java.util.regex.Pattern.compile(jsonPattern1, java.util.regex.Pattern.DOTALL);
+                    Matcher m1 = p1.matcher(scriptContent);
+
+                    if (m1.find()) {
+                        String jsonStr = m1.group(1);
+                        log.info("提取到 JSON 字符串（前200字符）: {}",
+                            jsonStr.substring(0, Math.min(200, jsonStr.length())));
+
+                        // TODO: 使用 JSON 解析库（如 Jackson 或 Gson）解析数据
+                        // 这里先简单提取 dvd_id
+                        videos.addAll(parseJsonToVideos(jsonStr));
+                    } else {
+                        log.info("未匹配到 window.xxx = {{...}} 模式");
+                    }
+                } catch (Exception e) {
+                    log.warn("JSON 提取失败", e);
+                }
+            }
+        }
+
+        // 如果发现混淆代码，输出完整内容用于分析
+        if (obfuscatedScript != null) {
+            String fullContent = obfuscatedScript.html();
+            log.warn("========== 混淆代码 Script #{} 完整内容开始 ==========", obfuscatedScriptIndex);
+            log.warn(fullContent);
+            log.warn("========== 混淆代码 Script #{} 完整内容结束 ==========", obfuscatedScriptIndex);
+
+            // 尝试分析混淆代码的特征
+            analyzeObfuscatedCode(fullContent, obfuscatedScriptIndex);
+        }
+
+        log.info("JSON 提取完成，共获得 {} 个视频", videos.size());
+        return videos;
+    }
+
+    /**
+     * 分析混淆代码，尝试找到视频数据的加载方式
+     */
+    private void analyzeObfuscatedCode(String code, int scriptIndex) {
+        log.info("========== 开始分析混淆代码 Script #{} ==========", scriptIndex);
+
+        // 检测是否包含 fetch/axios/ajax 等网络请求
+        if (code.contains("fetch(") || code.contains("axios") || code.contains("$.ajax") || code.contains("XMLHttpRequest")) {
+            log.warn("✓ 检测到网络请求相关代码（fetch/axios/ajax/XMLHttpRequest）");
+
+            // 尝试提取 API URL 模式
+            Pattern urlPattern = Pattern.compile("(['\"])(https?://[^'\"]+|/api/[^'\"]+)\\1");
+            Matcher matcher = urlPattern.matcher(code);
+            Set<String> urls = new HashSet<>();
+            while (matcher.find()) {
+                String url = matcher.group(2);
+                if (url.contains("api") || url.contains("search") || url.contains("video")) {
+                    urls.add(url);
+                }
+            }
+            if (!urls.isEmpty()) {
+                log.warn("✓ 发现可能的 API 端点:");
+                urls.forEach(url -> log.warn("  - {}", url));
+            }
+        }
+
+        // 检测 Alpine.js 或 Vue.js 相关代码
+        if (code.contains("Alpine") || code.contains("x-data") || code.contains("Vue")) {
+            log.warn("✓ 检测到 Alpine.js/Vue.js 框架代码");
+        }
+
+        // 检测数据挂载到 window 对象
+        Pattern windowPattern = Pattern.compile("window\\.([\\w_]+)\\s*=");
+        Matcher windowMatcher = windowPattern.matcher(code);
+        Set<String> windowVars = new HashSet<>();
+        while (windowMatcher.find()) {
+            windowVars.add(windowMatcher.group(1));
+        }
+        if (!windowVars.isEmpty()) {
+            log.warn("✓ 发现挂载到 window 的变量:");
+            windowVars.forEach(var -> log.warn("  - window.{}", var));
+        }
+
+        // 检测解混淆后的函数调用特征
+        if (code.contains("eval(function(p,a,c,k,e,d)")) {
+            log.warn("✓ 确认为 eval 函数打包混淆");
+            log.warn("  建议方案:");
+            log.warn("  1. 在浏览器控制台执行此代码并拦截网络请求，找到真实 API");
+            log.warn("  2. 使用无头浏览器（Selenium/Playwright）执行 JavaScript 并提取渲染后的 DOM");
+            log.warn("  3. 反向分析混淆代码，提取关键变量和函数");
+        }
+
+        log.info("========== 混淆代码分析完成 ==========");
+    }
+
+    /**
+     * 解析 JSON 字符串为视频列表（简化版）
+     */
+    private List<Video> parseJsonToVideos(String jsonStr) {
+        List<Video> videos = new ArrayList<>();
+
+        // 简单的正则提取（临时方案）
+        // 更好的做法是使用 Jackson/Gson，但需要先分析具体的 JSON 结构
+        Pattern dvdIdPattern = Pattern.compile("\"dvd_id\"\\s*:\\s*\"([^\"]+)\"");
+        Pattern uuidPattern = Pattern.compile("\"uuid\"\\s*:\\s*\"([^\"]+)\"");
+
+        Matcher matcher = dvdIdPattern.matcher(jsonStr);
+        while (matcher.find()) {
+            String dvdId = matcher.group(1);
+            Video video = new Video();
+            video.setCode(dvdId.toUpperCase());
+            video.setDetailUrl(BASE_URL + "/" + dvdId);
+            videos.add(video);
+            log.debug("从 JSON 提取到视频: {}", dvdId);
+        }
+
+        // 如果没有 dvd_id，尝试 uuid
+        if (videos.isEmpty()) {
+            matcher = uuidPattern.matcher(jsonStr);
+            while (matcher.find()) {
+                String uuid = matcher.group(1);
+                Video video = new Video();
+                video.setCode(uuid.toUpperCase());
+                video.setDetailUrl(BASE_URL + "/" + uuid);
+                videos.add(video);
+                log.debug("从 JSON 提取到视频（UUID）: {}", uuid);
+            }
+        }
+
+        return videos;
+    }
+
+    /**
+     * 从文本中提取时长（分钟）
+     */
+    private Integer extractDuration(String text) {
+        if (text == null || text.isEmpty()) {
+            return null;
+        }
+        Matcher matcher = DURATION_PATTERN.matcher(text);
+        if (matcher.find()) {
+            return Integer.parseInt(matcher.group(1));
+        }
+        // 尝试直接解析数字
+        try {
+            return Integer.parseInt(text.replaceAll("\\D", ""));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+}
+
+
+
+com/missav/bot/push/controller/PushRecordController.java
+package com.missav.bot.push.controller;
+
+import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.missav.bot.common.Result;
+import com.missav.bot.push.entity.PushRecord;
+import com.missav.bot.push.mapper.PushRecordMapper;
+import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/push-records")
+@RequiredArgsConstructor
+public class PushRecordController {
+
+    private final PushRecordMapper pushRecordMapper;
+
+    @GetMapping
+    public Result<IPage<PushRecord>> list(
+            @RequestParam(defaultValue = "1") Integer page,
+            @RequestParam(defaultValue = "10") Integer size) {
+        Page<PushRecord> pageParam = new Page<>(page, size);
+        IPage<PushRecord> result = pushRecordMapper.selectPage(pageParam, null);
+        return Result.success(result);
+    }
+
+    @GetMapping("/{id}")
+    public Result<PushRecord> getById(@PathVariable Long id) {
+        PushRecord record = pushRecordMapper.selectById(id);
+        if (record == null) {
+            return Result.error(404, "推送记录不存在");
+        }
+        return Result.success(record);
+    }
+
+    @GetMapping("/chat/{chatId}")
+    public Result<List<PushRecord>> getByChatId(@PathVariable Long chatId) {
+        List<PushRecord> records = pushRecordMapper.selectByChatIdOrderByPushedAtDesc(chatId);
+        return Result.success(records);
+    }
+
+    @GetMapping("/video/{videoId}")
+    public Result<List<PushRecord>> getByVideoId(@PathVariable Long videoId) {
+        List<PushRecord> records = pushRecordMapper.selectByVideoId(videoId);
+        return Result.success(records);
+    }
+
+    @GetMapping("/failed")
+    public Result<List<PushRecord>> getFailed() {
+        List<PushRecord> records = pushRecordMapper.selectByStatusOrderByPushedAtAsc(
+                PushRecord.PushStatus.FAILED.name());
+        return Result.success(records);
+    }
+}
+
+
+
+com/missav/bot/push/entity/PushRecord.java
+package com.missav.bot.push.entity;
+
+import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableId;
+import com.baomidou.mybatisplus.annotation.TableName;
+import com.missav.bot.common.entity.BaseEntity;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+
+import java.time.LocalDateTime;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@EqualsAndHashCode(callSuper = true)
+@TableName("push_records")
+public class PushRecord extends BaseEntity {
+
+    @TableId(type = IdType.AUTO)
+    private Long id;
+
+    private Long videoId;
+    private Long chatId;
+    private PushStatus status;
+    private String failReason;
+    private LocalDateTime pushedAt;
+    private Integer messageId;
+
+    public enum PushStatus {
+        SUCCESS,
+        FAILED
+    }
+}
+
+
+
+com/missav/bot/push/mapper/PushRecordMapper.java
+package com.missav.bot.push.entity;
+
+import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableId;
+import com.baomidou.mybatisplus.annotation.TableName;
+import com.missav.bot.common.entity.BaseEntity;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+
+import java.time.LocalDateTime;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@EqualsAndHashCode(callSuper = true)
+@TableName("push_records")
+public class PushRecord extends BaseEntity {
+
+    @TableId(type = IdType.AUTO)
+    private Long id;
+
+    private Long videoId;
+    private Long chatId;
+    private PushStatus status;
+    private String failReason;
+    private LocalDateTime pushedAt;
+    private Integer messageId;
+
+    public enum PushStatus {
+        SUCCESS,
+        FAILED
+    }
+}
+
+
+
+com/missav/bot/push/service/impl/PushServiceImpl.java
+package com.missav.bot.push.service.impl;
+
+import com.missav.bot.push.entity.PushRecord;
+import com.missav.bot.push.mapper.PushRecordMapper;
+import com.missav.bot.push.service.IPushService;
+import com.missav.bot.subscription.entity.Subscription;
+import com.missav.bot.subscription.service.ISubscriptionService;
+import com.missav.bot.telegram.TelegramMessageService;
+import com.missav.bot.video.entity.Video;
+import com.missav.bot.crawler.service.ICrawlerService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class PushServiceImpl implements IPushService {
+
+    private final TelegramMessageService telegramMessageService;
+    private final ISubscriptionService subscriptionService;
+    private final ICrawlerService crawlerService;
+    private final PushRecordMapper pushRecordMapper;
+
+    @Override
+    @Transactional
+    public void pushVideoToSubscribers(Video video) {
+        // 一次性加载所有订阅
+        List<Subscription> allSubscriptions = subscriptionService.list();
+        if (allSubscriptions.isEmpty()) {
+            crawlerService.markAsPushed(video.getId());
+            log.debug("没有任何订阅，视频 {} 已标记为已推送", video.getCode());
+            return;
+        }
+
+        // 在内存中匹配订阅，收集所有需要推送的 chatId
+        Set<Long> targetChatIds = new HashSet<>();
+
+        for (Subscription sub : allSubscriptions) {
+            boolean matches = false;
+
+            if (sub.getType() == Subscription.SubscriptionType.ALL) {
+                matches = true;
+            } else if (sub.getType() == Subscription.SubscriptionType.ACTRESS && video.getActresses() != null) {
+                String[] actresses = video.getActresses().split(",\\s*");
+                for (String actress : actresses) {
+                    if (actress.trim().equals(sub.getKeyword())) {
+                        matches = true;
+                        break;
+                    }
+                }
+            } else if (sub.getType() == Subscription.SubscriptionType.TAG && video.getTags() != null) {
+                String[] tags = video.getTags().split(",\\s*");
+                for (String tag : tags) {
+                    if (tag.trim().equals(sub.getKeyword())) {
+                        matches = true;
+                        break;
+                    }
+                }
+            }
+
+            if (matches) {
+                targetChatIds.add(sub.getChatId());
+            }
+        }
+
+        if (targetChatIds.isEmpty()) {
+            crawlerService.markAsPushed(video.getId());
+            log.debug("视频 {} 没有匹配的订阅者，已标记为已推送", video.getCode());
+            return;
+        }
+
+        // 批量查询已推送的 chatId
+        List<Long> pushedChatIds = pushRecordMapper.selectPushedChatIds(
+            video.getId(),
+            new java.util.ArrayList<>(targetChatIds),
+            PushRecord.PushStatus.SUCCESS.name()
+        );
+        targetChatIds.removeAll(pushedChatIds);
+
+        if (targetChatIds.isEmpty()) {
+            crawlerService.markAsPushed(video.getId());
+            log.debug("视频 {} 已推送给所有订阅者", video.getCode());
+            return;
+        }
+
+        // 推送给剩余的 chatId
+        log.debug("视频 {} 需要推送给 {} 个订阅者", video.getCode(), targetChatIds.size());
+        for (Long chatId : targetChatIds) {
+            pushToChatInternal(video, chatId);
+        }
+
+        crawlerService.markAsPushed(video.getId());
+        log.info("视频 {} 推送完成，共推送给 {} 个订阅者", video.getCode(), targetChatIds.size());
+    }
+
+    private void pushToChatInternal(Video video, Long chatId) {
+        boolean success = telegramMessageService.pushVideo(chatId, video);
+
+        PushRecord record = PushRecord.builder()
+                .videoId(video.getId())
+                .chatId(chatId)
+                .status(success ? PushRecord.PushStatus.SUCCESS : PushRecord.PushStatus.FAILED)
+                .failReason(success ? null : "推送失败")
+                .pushedAt(LocalDateTime.now())
+                .build();
+        pushRecordMapper.insert(record);
+
+        if (success) {
+            log.info("推送成功: {} -> chatId={}", video.getCode(), chatId);
+        } else {
+            log.warn("推送失败: {} -> chatId={}", video.getCode(), chatId);
+        }
+
+        try {
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    @Override
+    public void pushVideoToChat(Video video, Long chatId) {
+        pushToChatInternal(video, chatId);
+    }
+
+    @Override
+    @Transactional
+    public void pushUnpushedVideos() {
+        List<Video> unpushedVideos = crawlerService.getUnpushedVideos();
+        log.debug("待推送视频数: {}", unpushedVideos.size());
+
+        for (Video video : unpushedVideos) {
+            pushVideoToSubscribers(video);
+        }
+    }
+}
+
+
+
+com/missav/bot/push/service/IPushService.java
+package com.missav.bot.push.service;
+
+import com.missav.bot.video.entity.Video;
+
+/**
+ * 推送服务接口
+ */
+public interface IPushService {
+
+    /**
+     * 推送视频到所有匹配的订阅者
+     * @param video 视频
+     */
+    void pushVideoToSubscribers(Video video);
+
+    /**
+     * 推送所有未推送的视频
+     */
+    void pushUnpushedVideos();
+
+    /**
+     * 推送视频给指定用户（会记录到 push_records 表，避免重复推送）
+     * @param video 视频
+     * @param chatId 聊天ID
+     */
+    void pushVideoToChat(Video video, Long chatId);
+}
+
+
+
+com/missav/bot/scheduler/CrawlScheduler.java
+package com.missav.bot.scheduler;
+
+import com.missav.bot.subscription.entity.Subscription.SubscriptionType;
+import com.missav.bot.video.entity.Video;
+import com.missav.bot.crawler.service.ICrawlerService;
+import com.missav.bot.push.service.IPushService;
+import com.missav.bot.subscription.service.ISubscriptionService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import jakarta.annotation.PostConstruct;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class CrawlScheduler {
+
+    private final ICrawlerService crawlerService;
+    private final IPushService pushService;
+    private final ISubscriptionService subscriptionService;
+
+    private final AtomicBoolean isRunning = new AtomicBoolean(false);
+
+    @Value("${crawler.enabled:true}")
+    private boolean crawlerEnabled;
+
+    @Value("${crawler.initial-pages:2}")
+    private int initialPages;
+
+    @Value("${telegram.bot.default-chat-id:0}")
+    private Long defaultChatId;
+
+    /**
+     * 启动时执行首次抓取
+     */
+    @PostConstruct
+    public void init() {
+        // 如果配置了默认 Chat ID，自动创建订阅
+        if (defaultChatId != 0) {
+            try {
+                subscriptionService.subscribe(defaultChatId, "supergroup", SubscriptionType.ALL, null);
+                log.info("已自动订阅默认群组: {}", defaultChatId);
+            } catch (Exception e) {
+                log.warn("订阅默认群组失败: {}", e.getMessage());
+            }
+        } else {
+            log.info("未配置 BOT_CHAT_ID，Bot 会在收到群组消息时自动订阅");
+        }
+
+        // 执行首次抓取
+        if (crawlerEnabled) {
+            log.info("机器人启动，执行首次抓取...");
+            // 异步执行，避免阻塞启动
+            new Thread(() -> {
+                try {
+                    Thread.sleep(5000); // 等待5秒确保Bot完全启动
+                    executeCrawlAndPush(initialPages);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }).start();
+        }
+    }
+
+    /**
+     * 定时抓取新视频 - 每15分钟执行一次
+     */
+    @Scheduled(fixedDelayString = "${crawler.interval:900000}", initialDelay = 60000)
+    public void scheduledCrawl() {
+        if (!crawlerEnabled) {
+            log.debug("爬虫已禁用");
+            return;
+        }
+        executeCrawlAndPush(1);
+    }
+
+    /**
+     * 执行抓取和推送
+     */
+    private void executeCrawlAndPush(int pages) {
+        // 防止并发执行
+        if (!isRunning.compareAndSet(false, true)) {
+            log.warn("上一次抓取任务尚未完成，跳过本次执行");
+            return;
+        }
+
+        try {
+            log.info("开始定时抓取任务...");
+            long startTime = System.currentTimeMillis();
+
+            // 1. 抓取新视频
+            List<Video> newVideos = crawlerService.crawlAndSaveNewVideos(pages);
+            log.info("抓取完成，发现{}个新视频", newVideos.size());
+
+            // 2. 推送未推送的视频
+            pushService.pushUnpushedVideos();
+
+            long duration = System.currentTimeMillis() - startTime;
+            log.info("定时任务完成，耗时{}ms", duration);
+
+        } catch (Exception e) {
+            log.error("定时抓取任务执行失败", e);
+        } finally {
+            isRunning.set(false);
+        }
+    }
+
+    /**
+     * 定期清理旧推送记录
+     */
+    @Scheduled(cron = "${crawler.cleanup-cron:0 0 3 * * ?}")
+    public void cleanupOldRecords() {
+        log.info("执行清理任务...");
+        // 可以在这里添加清理逻辑
+    }
+}
+
+
+
+com/missav/bot/subscription/controller/SubscriptionController.java
+package com.missav.bot.subscription.controller;
+
+import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.missav.bot.common.Result;
+import com.missav.bot.subscription.entity.Subscription;
+import com.missav.bot.subscription.mapper.SubscriptionMapper;
+import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+/**
+ * 订阅管理接口
+ */
+@RestController
+@RequestMapping("/api/subscriptions")
+@RequiredArgsConstructor
+public class SubscriptionController {
+
+    private final SubscriptionMapper subscriptionMapper;
+
+    /**
+     * 分页查询订阅列表
+     */
+    @GetMapping
+    public Result<IPage<Subscription>> list(
+            @RequestParam(defaultValue = "1") Integer page,
+            @RequestParam(defaultValue = "10") Integer size) {
+        Page<Subscription> pageParam = new Page<>(page, size);
+        IPage<Subscription> result = subscriptionMapper.selectPage(pageParam, null);
+        return Result.success(result);
+    }
+
+    /**
+     * 根据ID查询订阅
+     */
+    @GetMapping("/{id}")
+    public Result<Subscription> getById(@PathVariable Long id) {
+        Subscription subscription = subscriptionMapper.selectById(id);
+        if (subscription == null) {
+            return Result.error(404, "订阅不存在");
+        }
+        return Result.success(subscription);
+    }
+
+    /**
+     * 查询指定聊天的订阅
+     */
+    @GetMapping("/chat/{chatId}")
+    public Result<List<Subscription>> getByChatId(@PathVariable Long chatId) {
+        List<Subscription> subscriptions = subscriptionMapper.selectByChatIdAndEnabledTrue(chatId);
+        return Result.success(subscriptions);
+    }
+
+    /**
+     * 创建订阅
+     */
+    @PostMapping
+    public Result<Subscription> create(@RequestBody Subscription subscription) {
+        String typeStr = subscription.getType().name();
+        if (subscriptionMapper.existsByChatIdAndTypeAndKeyword(
+                subscription.getChatId(), typeStr, subscription.getKeyword())) {
+            return Result.error(400, "订阅已存在");
+        }
+        subscriptionMapper.insert(subscription);
+        return Result.success(subscription);
+    }
+
+    /**
+     * 更新订阅
+     */
+    @PutMapping("/{id}")
+    public Result<Subscription> update(@PathVariable Long id, @RequestBody Subscription subscription) {
+        Subscription existing = subscriptionMapper.selectById(id);
+        if (existing == null) {
+            return Result.error(404, "订阅不存在");
+        }
+        subscription.setId(id);
+        subscriptionMapper.updateById(subscription);
+        return Result.success(subscription);
+    }
+
+    /**
+     * 删除订阅
+     */
+    @DeleteMapping("/{id}")
+    public Result<Void> delete(@PathVariable Long id) {
+        Subscription existing = subscriptionMapper.selectById(id);
+        if (existing == null) {
+            return Result.error(404, "订阅不存在");
+        }
+        subscriptionMapper.deleteById(id);
+        return Result.success();
+    }
+
+    /**
+     * 删除指定聊天的所有订阅
+     */
+    @DeleteMapping("/chat/{chatId}")
+    public Result<Void> deleteByChatId(@PathVariable Long chatId) {
+        subscriptionMapper.deleteByChatId(chatId);
+        return Result.success();
+    }
+
+    /**
+     * 查询所有启用的聊天ID
+     */
+    @GetMapping("/active-chats")
+    public Result<List<Long>> getActiveChats() {
+        List<Long> chatIds = subscriptionMapper.selectDistinctChatIdByEnabledTrue();
+        return Result.success(chatIds);
+    }
+}
+
+
+
+com/missav/bot/subscription/entity/Subscription.java
+package com.missav.bot.subscription.entity;
+
+import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableId;
+import com.baomidou.mybatisplus.annotation.TableName;
+import com.missav.bot.common.entity.BaseEntity;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+
+/**
+ * 订阅实体
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@EqualsAndHashCode(callSuper = true)
+@TableName("subscriptions")
+public class Subscription extends BaseEntity {
+
+    /**
+     * 主键ID
+     */
+    @TableId(type = IdType.AUTO)
+    private Long id;
+
+    /**
+     * Telegram聊天ID（用户或群组）
+     */
+    private Long chatId;
+
+    /**
+     * 聊天类型：private-私聊，group-群组，supergroup-超级群组
+     */
+    private String chatType;
+
+    /**
+     * 订阅类型：ALL-全部，ACTRESS-演员，TAG-标签
+     */
+    private SubscriptionType type;
+
+    /**
+     * 订阅关键词（演员名或标签名）
+     */
+    private String keyword;
+
+    /**
+     * 是否启用：0-禁用，1-启用
+     */
+    private Boolean enabled;
+
+    public enum SubscriptionType {
+        ALL,      // 订阅全部
+        ACTRESS,  // 订阅演员
+        TAG       // 订阅标签
+    }
+}
+
+
+
+com/missav/bot/subscription/mapper/SubscriptionMapper.java
+package com.missav.bot.subscription.mapper;
+
+import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import com.missav.bot.subscription.entity.Subscription;
+import org.apache.ibatis.annotations.Delete;
+import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
+
+import java.util.List;
+
+@Mapper
+public interface SubscriptionMapper extends BaseMapper<Subscription> {
+
+    /**
+     * 查找聊天的所有启用订阅
+     */
+    @Select("SELECT * FROM subscriptions WHERE chat_id = #{chatId} AND enabled = 1")
+    List<Subscription> selectByChatIdAndEnabledTrue(@Param("chatId") Long chatId);
+
+    /**
+     * 查找所有启用的指定类型订阅
+     */
+    @Select("SELECT * FROM subscriptions WHERE type = #{type} AND enabled = 1")
+    List<Subscription> selectByTypeAndEnabledTrue(@Param("type") String type);
+
+    /**
+     * 查找指定类型和关键词的订阅
+     */
+    @Select("SELECT * FROM subscriptions WHERE type = #{type} AND keyword = #{keyword} AND enabled = 1")
+    List<Subscription> selectByTypeAndKeywordAndEnabledTrue(@Param("type") String type, @Param("keyword") String keyword);
+
+    /**
+     * 检查订阅是否存在
+     */
+    @Select("SELECT COUNT(*) > 0 FROM subscriptions WHERE chat_id = #{chatId} AND type = #{type} AND keyword = #{keyword}")
+    boolean existsByChatIdAndTypeAndKeyword(@Param("chatId") Long chatId, @Param("type") String type, @Param("keyword") String keyword);
+
+    /**
+     * 查找特定订阅
+     */
+    @Select("SELECT * FROM subscriptions WHERE chat_id = #{chatId} AND type = #{type} AND keyword = #{keyword}")
+    Subscription selectByChatIdAndTypeAndKeyword(@Param("chatId") Long chatId, @Param("type") String type, @Param("keyword") String keyword);
+
+    /**
+     * 删除聊天的所有订阅
+     */
+    @Delete("DELETE FROM subscriptions WHERE chat_id = #{chatId}")
+    int deleteByChatId(@Param("chatId") Long chatId);
+
+    /**
+     * 获取所有需要推送的聊天ID（去重）
+     */
+    @Select("SELECT DISTINCT chat_id FROM subscriptions WHERE enabled = 1")
+    List<Long> selectDistinctChatIdByEnabledTrue();
+}
+
+
+
+com/missav/bot/subscription/service/impl/SubscriptionServiceImpl.java
+package com.missav.bot.subscription.service.impl;
+
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.missav.bot.subscription.entity.Subscription;
+import com.missav.bot.subscription.entity.Subscription.SubscriptionType;
+import com.missav.bot.subscription.mapper.SubscriptionMapper;
+import com.missav.bot.subscription.service.ISubscriptionService;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+
+@Slf4j
+@Service
+public class SubscriptionServiceImpl extends ServiceImpl<SubscriptionMapper, Subscription> implements ISubscriptionService {
+
+    @Override
+    @Transactional
+    public Subscription subscribe(Long chatId, String chatType, SubscriptionType type, String keyword) {
+        String typeStr = type.name();
+        if (baseMapper.existsByChatIdAndTypeAndKeyword(chatId, typeStr, keyword)) {
+            log.info("订阅已存在: chatId={}, type={}, keyword={}", chatId, type, keyword);
+            return baseMapper.selectByChatIdAndTypeAndKeyword(chatId, typeStr, keyword);
+        }
+
+        Subscription subscription = Subscription.builder()
+                .chatId(chatId)
+                .chatType(chatType)
+                .type(type)
+                .keyword(keyword)
+                .enabled(true)
+                .build();
+
+        save(subscription);
+        log.info("添加订阅: chatId={}, type={}, keyword={}", chatId, type, keyword);
+        return subscription;
+    }
+
+    @Override
+    @Transactional
+    public void unsubscribe(Long chatId, SubscriptionType type, String keyword) {
+        String typeStr = type.name();
+        Subscription sub = baseMapper.selectByChatIdAndTypeAndKeyword(chatId, typeStr, keyword);
+        if (sub != null) {
+            sub.setEnabled(false);
+            updateById(sub);
+            log.info("取消订阅: chatId={}, type={}, keyword={}", chatId, type, keyword);
+        }
+    }
+
+    @Override
+    @Transactional
+    public void unsubscribeAll(Long chatId) {
+        List<Subscription> subscriptions = baseMapper.selectByChatIdAndEnabledTrue(chatId);
+        for (Subscription sub : subscriptions) {
+            sub.setEnabled(false);
+        }
+        updateBatchById(subscriptions);
+        log.info("取消全部订阅: chatId={}, count={}", chatId, subscriptions.size());
+    }
+
+    @Override
+    public List<Subscription> getSubscriptions(Long chatId) {
+        return baseMapper.selectByChatIdAndEnabledTrue(chatId);
+    }
+
+    @Override
+    public List<Subscription> getAllSubscriptions() {
+        return baseMapper.selectByTypeAndEnabledTrue(SubscriptionType.ALL.name());
+    }
+
+    @Override
+    public List<Subscription> getActressSubscriptions(String actress) {
+        return baseMapper.selectByTypeAndKeywordAndEnabledTrue(SubscriptionType.ACTRESS.name(), actress);
+    }
+
+    @Override
+    public List<Subscription> getTagSubscriptions(String tag) {
+        return baseMapper.selectByTypeAndKeywordAndEnabledTrue(SubscriptionType.TAG.name(), tag);
+    }
+
+    @Override
+    public boolean matchesSubscription(Subscription subscription, String actresses, String tags) {
+        if (subscription.getType() == SubscriptionType.ALL) {
+            return true;
+        }
+
+        String keyword = subscription.getKeyword();
+        if (keyword == null || keyword.isEmpty()) {
+            return false;
+        }
+
+        if (subscription.getType() == SubscriptionType.ACTRESS) {
+            return actresses != null && actresses.contains(keyword);
+        }
+
+        if (subscription.getType() == SubscriptionType.TAG) {
+            return tags != null && tags.contains(keyword);
+        }
+
+        return false;
+    }
+}
+
+
+
+com/missav/bot/subscription/service/ISubscriptionService.java
+package com.missav.bot.subscription.service;
+
+import com.baomidou.mybatisplus.extension.service.IService;
+import com.missav.bot.subscription.entity.Subscription;
+import com.missav.bot.subscription.entity.Subscription.SubscriptionType;
+
+import java.util.List;
+
+/**
+ * 订阅服务接口
+ */
+public interface ISubscriptionService extends IService<Subscription> {
+
+    /**
+     * 添加订阅
+     */
+    Subscription subscribe(Long chatId, String chatType, SubscriptionType type, String keyword);
+
+    /**
+     * 取消特定订阅
+     */
+    void unsubscribe(Long chatId, SubscriptionType type, String keyword);
+
+    /**
+     * 取消全部订阅
+     */
+    void unsubscribeAll(Long chatId);
+
+    /**
+     * 获取用户的订阅列表
+     */
+    List<Subscription> getSubscriptions(Long chatId);
+
+    /**
+     * 获取所有订阅全部的聊天
+     */
+    List<Subscription> getAllSubscriptions();
+
+    /**
+     * 获取订阅指定演员的聊天
+     */
+    List<Subscription> getActressSubscriptions(String actress);
+
+    /**
+     * 获取订阅指定标签的聊天
+     */
+    List<Subscription> getTagSubscriptions(String tag);
+
+    /**
+     * 检查视频是否匹配订阅
+     */
+    boolean matchesSubscription(Subscription subscription, String actresses, String tags);
+}
+
+
+
+com/missav/bot/telegram/TelegramMessageService.java
+package com.missav.bot.telegram;
+
+import com.missav.bot.video.entity.Video;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
+import org.telegram.telegrambots.meta.api.methods.send.SendVideo;
+import org.telegram.telegrambots.meta.api.objects.InputFile;
+import org.telegram.telegrambots.meta.bots.AbsSender;
+import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+
+/**
+ * Telegram 消息发送服务
+ * 负责所有 Telegram 消息的格式化和发送
+ */
+@Slf4j
+@Service
+public class TelegramMessageService {
+
+    private AbsSender bot;
+
+    @Value("${telegram.bot.username:MissavBot}")
+    private String botUsername;
+
+    /**
+     * 设置 Bot 实例（由 MissavBot 启动时调用）
+     */
+    public void setBot(AbsSender bot) {
+        this.bot = bot;
+    }
+
+    /**
+     * 推送视频到指定聊天
+     * @return 是否推送成功
+     */
+    public boolean pushVideo(Long chatId, Video video) {
+        try {
+            String caption = formatVideoMessage(video);
+
+            // 优先发送预览视频
+            if (video.getPreviewUrl() != null && !video.getPreviewUrl().isEmpty()) {
+                return sendVideoWithCaption(chatId, video.getPreviewUrl(), video.getCoverUrl(), caption);
+            }
+
+            // 其次发送封面图
+            if (video.getCoverUrl() != null && !video.getCoverUrl().isEmpty()) {
+                return sendPhotoWithCaption(chatId, video.getCoverUrl(), caption);
+            }
+
+            // 最后发送纯文本
+            sendMarkdown(chatId, caption);
+            return true;
+        } catch (Exception e) {
+            log.error("推送视频失败: chatId={}, code={}", chatId, video.getCode(), e);
+            return false;
+        }
+    }
+
+    /**
+     * 格式化视频消息
+     */
+    public String formatVideoMessage(Video video) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("🎬 *新片上架*\n\n");
+        sb.append("📌 番号: `").append(escapeMarkdown(video.getCode())).append("`\n");
+
+        if (video.getActresses() != null && !video.getActresses().isEmpty()) {
+            sb.append("👩 演员: ").append(escapeMarkdown(video.getActresses())).append("\n");
+        }
+
+        if (video.getTags() != null && !video.getTags().isEmpty()) {
+            sb.append("🏷️ 标签: ").append(formatTags(video.getTags())).append("\n");
+        }
+
+        if (video.getDuration() != null) {
+            sb.append("⏱️ 时长: ").append(video.getDuration()).append(" 分钟\n");
+        }
+
+        sb.append("\n🔗 [查看详情](").append(video.getDetailUrl()).append(")");
+
+        return sb.toString();
+    }
+
+    /**
+     * 转义 Markdown 特殊字符
+     */
+    private String escapeMarkdown(String text) {
+        if (text == null) return "";
+        return text.replace("_", "\\_")
+                   .replace("*", "\\*")
+                   .replace("[", "\\[")
+                   .replace("]", "\\]")
+                   .replace("(", "\\(")
+                   .replace(")", "\\)")
+                   .replace("~", "\\~")
+                   .replace("`", "\\`")
+                   .replace(">", "\\>")
+                   .replace("#", "\\#")
+                   .replace("+", "\\+")
+                   .replace("-", "\\-")
+                   .replace("=", "\\=")
+                   .replace("|", "\\|")
+                   .replace("{", "\\{")
+                   .replace("}", "\\}")
+                   .replace(".", "\\.")
+                   .replace("!", "\\!");
+    }
+
+    private String formatTags(String tags) {
+        if (tags == null) return "";
+        String[] tagArr = tags.split(",\\s*");
+        StringBuilder sb = new StringBuilder();
+        for (String tag : tagArr) {
+            sb.append("#").append(escapeMarkdown(tag.trim())).append(" ");
+        }
+        return sb.toString().trim();
+    }
+
+    public boolean sendVideoWithCaption(Long chatId, String videoUrl, String thumbUrl, String caption) {
+        try {
+            SendVideo sendVideo = new SendVideo();
+            sendVideo.setChatId(chatId.toString());
+            sendVideo.setVideo(new InputFile(videoUrl));
+            if (thumbUrl != null && !thumbUrl.isEmpty()) {
+                sendVideo.setThumbnail(new InputFile(thumbUrl));
+            }
+            sendVideo.setCaption(caption);
+            sendVideo.setParseMode("Markdown");
+            bot.execute(sendVideo);
+            return true;
+        } catch (TelegramApiException e) {
+            log.warn("发送视频失败，尝试发送图片: {}", e.getMessage());
+            return sendPhotoWithCaption(chatId, thumbUrl, caption);
+        }
+    }
+
+    public boolean sendPhotoWithCaption(Long chatId, String photoUrl, String caption) {
+        // 验证 URL 是否有效
+        if (photoUrl == null || photoUrl.trim().isEmpty()) {
+            log.warn("图片 URL 为空，直接发送纯文本");
+            sendMarkdown(chatId, caption);
+            return true;
+        }
+
+        // 验证 URL 格式
+        if (!photoUrl.startsWith("http://") && !photoUrl.startsWith("https://")) {
+            log.warn("图片 URL 格式无效: {}, 直接发送纯文本", photoUrl);
+            sendMarkdown(chatId, caption);
+            return true;
+        }
+
+        try {
+            SendPhoto sendPhoto = new SendPhoto();
+            sendPhoto.setChatId(chatId.toString());
+            sendPhoto.setPhoto(new InputFile(photoUrl.trim()));
+            sendPhoto.setCaption(caption);
+            sendPhoto.setParseMode("Markdown");
+            bot.execute(sendPhoto);
+            return true;
+        } catch (TelegramApiException e) {
+            log.warn("发送图片失败 (URL: {}): {}, 发送纯文本", photoUrl, e.getMessage());
+            sendMarkdown(chatId, caption);
+            return true;
+        }
+    }
+
+    public void sendMarkdown(Long chatId, String text) {
+        try {
+            SendMessage message = new SendMessage();
+            message.setChatId(chatId.toString());
+            message.setText(text);
+            message.setParseMode("Markdown");
+            bot.execute(message);
+        } catch (TelegramApiException e) {
+            log.error("发送消息失败", e);
+        }
+    }
+}
+
+
+
+com/missav/bot/video/controller/VideoController.java
+package com.missav.bot.video.controller;
+
+import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.missav.bot.common.Result;
+import com.missav.bot.video.entity.Video;
+import com.missav.bot.video.mapper.VideoMapper;
+import com.missav.bot.video.service.IVideoService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+/**
+ * 视频管理接口
+ */
+@RestController
+@RequestMapping("/api/videos")
+@RequiredArgsConstructor
+public class VideoController {
+
+    private final IVideoService videoService;
+    private final VideoMapper videoMapper;
+
+    /**
+     * 分页查询视频列表
+     */
+    @GetMapping
+    public Result<IPage<Video>> list(
+            @RequestParam(defaultValue = "1") Integer page,
+            @RequestParam(defaultValue = "10") Integer size) {
+        Page<Video> pageParam = new Page<>(page, size);
+        IPage<Video> result = videoService.page(pageParam);
+        return Result.success(result);
+    }
+
+    /**
+     * 根据ID查询视频
+     */
+    @GetMapping("/{id}")
+    public Result<Video> getById(@PathVariable Long id) {
+        Video video = videoService.getById(id);
+        if (video == null) {
+            return Result.error(404, "视频不存在");
+        }
+        return Result.success(video);
+    }
+
+    /**
+     * 根据番号查询视频
+     */
+    @GetMapping("/code/{code}")
+    public Result<Video> getByCode(@PathVariable String code) {
+        Video video = videoMapper.selectByCode(code);
+        if (video == null) {
+            return Result.error(404, "视频不存在");
+        }
+        return Result.success(video);
+    }
+
+    /**
+     * 搜索视频（按演员）
+     */
+    @GetMapping("/search/actress")
+    public Result<List<Video>> searchByActress(@RequestParam String actress) {
+        List<Video> videos = videoMapper.selectByActress(actress);
+        return Result.success(videos);
+    }
+
+    /**
+     * 搜索视频（按标签）
+     */
+    @GetMapping("/search/tag")
+    public Result<List<Video>> searchByTag(@RequestParam String tag) {
+        List<Video> videos = videoMapper.selectByTag(tag);
+        return Result.success(videos);
+    }
+
+    /**
+     * 创建视频
+     */
+    @PostMapping
+    public Result<Video> create(@RequestBody Video video) {
+        if (videoMapper.existsByCode(video.getCode())) {
+            return Result.error(400, "番号已存在");
+        }
+        videoService.save(video);
+        return Result.success(video);
+    }
+
+    /**
+     * 更新视频
+     */
+    @PutMapping("/{id}")
+    public Result<Video> update(@PathVariable Long id, @RequestBody Video video) {
+        Video existing = videoService.getById(id);
+        if (existing == null) {
+            return Result.error(404, "视频不存在");
+        }
+        video.setId(id);
+        videoService.updateById(video);
+        return Result.success(video);
+    }
+
+    /**
+     * 删除视频
+     */
+    @DeleteMapping("/{id}")
+    public Result<Void> delete(@PathVariable Long id) {
+        Video existing = videoService.getById(id);
+        if (existing == null) {
+            return Result.error(404, "视频不存在");
+        }
+        videoService.removeById(id);
+        return Result.success();
+    }
+
+    /**
+     * 查询未推送的视频
+     */
+    @GetMapping("/unpushed")
+    public Result<List<Video>> getUnpushed() {
+        List<Video> videos = videoMapper.selectUnpushedVideos();
+        return Result.success(videos);
+    }
+
+    /**
+     * 查询最新视频
+     */
+    @GetMapping("/latest")
+    public Result<List<Video>> getLatest() {
+        List<Video> videos = videoMapper.selectTop50ByCreatedTimeDesc();
+        return Result.success(videos);
+    }
+}
+
+
+
+com/missav/bot/video/entity/Video.java
+package com.missav.bot.video.entity;
+
+import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableId;
+import com.baomidou.mybatisplus.annotation.TableName;
+import com.missav.bot.common.entity.BaseEntity;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+
+import java.time.LocalDateTime;
+
+/**
+ * 视频实体
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@EqualsAndHashCode(callSuper = true)
+@TableName("videos")
+public class Video extends BaseEntity {
+
+    @TableId(type = IdType.AUTO)
+    private Long id;
+
+    private String code;
+    private String title;
+    private String actresses;
+    private String tags;
+    private Integer duration;
+    private LocalDateTime releaseDate;
+    private String coverUrl;
+    private String previewUrl;
+    private String detailUrl;
+    private Boolean pushed;
+}
+
+
+
+com/missav/bot/video/mapper/VideoMapper.java
+package com.missav.bot.video.mapper;
+
+import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import com.missav.bot.video.entity.Video;
+import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
+
+import java.time.LocalDateTime;
+import java.util.List;
+
+@Mapper
+public interface VideoMapper extends BaseMapper<Video> {
+
+    /**
+     * 根据番号查找视频
+     */
+    @Select("SELECT * FROM videos WHERE code = #{code}")
+    Video selectByCode(@Param("code") String code);
+
+    /**
+     * 检查番号是否存在
+     */
+    @Select("SELECT COUNT(*) > 0 FROM videos WHERE code = #{code}")
+    boolean existsByCode(@Param("code") String code);
+
+    /**
+     * 查找未推送的视频
+     */
+    @Select("SELECT * FROM videos WHERE pushed = 0 ORDER BY created_time ASC")
+    List<Video> selectUnpushedVideos();
+
+    /**
+     * 根据演员查找视频
+     */
+    @Select("SELECT * FROM videos WHERE actresses LIKE CONCAT('%', #{actress}, '%')")
+    List<Video> selectByActress(@Param("actress") String actress);
+
+    /**
+     * 根据标签查找视频
+     */
+    @Select("SELECT * FROM videos WHERE tags LIKE CONCAT('%', #{tag}, '%')")
+    List<Video> selectByTag(@Param("tag") String tag);
+
+    /**
+     * 查找指定时间后创建的视频
+     */
+    @Select("SELECT * FROM videos WHERE created_time > #{time} ORDER BY created_time DESC")
+    List<Video> selectByCreatedTimeAfter(@Param("time") LocalDateTime time);
+
+    /**
+     * 查找最新的N条视频
+     */
+    @Select("SELECT * FROM videos ORDER BY created_time DESC LIMIT 50")
+    List<Video> selectTop50ByCreatedTimeDesc();
+
+    /**
+     * 批量检查番号是否存在
+     */
+    @Select("<script>" +
+            "SELECT code FROM videos WHERE code IN " +
+            "<foreach collection='codes' item='code' open='(' separator=',' close=')'>" +
+            "#{code}" +
+            "</foreach>" +
+            "</script>")
+    List<String> selectExistingCodes(@Param("codes") List<String> codes);
+}
+
+
+
+com/missav/bot/video/service/impl/VideoServiceImpl.java
+package com.missav.bot.video.service.impl;
+
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.missav.bot.video.entity.Video;
+import com.missav.bot.video.mapper.VideoMapper;
+import com.missav.bot.video.service.IVideoService;
+import org.springframework.stereotype.Service;
+
+/**
+ * 视频服务实现
+ */
+@Service
+public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements IVideoService {
+}
+
+
+
+com/missav/bot/video/service/IVideoService.java
+package com.missav.bot.video.service;
+
+import com.baomidou.mybatisplus.extension.service.IService;
+import com.missav.bot.video.entity.Video;
+
+/**
+ * 视频服务接口
+ */
+public interface IVideoService extends IService<Video> {
+}
+
+
+
+com/missav/bot/MissavBotApplication.java
+package com.missav.bot;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@EnableScheduling
+public class MissavBotApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(MissavBotApplication.class, args);
+    }
+}
+
+
+
+application.yaml
+server:
+  port: 8000
+
+spring:
+  application:
+    name: missav-bot
+
+  servlet:
+    multipart:
+      enabled: false  # 禁用文件上传解析，Bot 不需要此功能
+
+  sql:
+    init:
+      mode: never
+
+  datasource:
+    url: jdbc:mysql://${DB_HOST:localhost}:3308/missav_bot?useSSL=false&serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=UTF-8&allowPublicKeyRetrieval=true
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:your_password}
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    # 生产环境关闭 SQL 日志，开发时可以打开
+    # log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+telegram:
+  bot:
+    token: ${BOT_TOKEN:YOUR_BOT_TOKEN}
+    username: ${BOT_USERNAME:YOUR_BOT_USERNAME}
+    default-chat-id: ${BOT_CHAT_ID:0}
+
+crawler:
+  enabled: ${CRAWLER_ENABLED:true}
+  interval: ${CRAWLER_INTERVAL:900000}  # 爬取间隔（毫秒），默认15分钟
+  initial-pages: ${CRAWLER_INITIAL_PAGES:2}  # 首次启动爬取页数
+  cleanup-cron: ${CRAWLER_CLEANUP_CRON:0 0 3 * * ?}  # 清理任务 cron 表达式，默认每天凌晨3点
+  user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.missav.bot: ${LOG_LEVEL_APP:INFO}
+    com.missav.bot.crawler: ${LOG_LEVEL_CRAWLER:INFO}
+    com.missav.bot.push: ${LOG_LEVEL_PUSH:INFO}
+    com.missav.bot.scheduler: ${LOG_LEVEL_SCHEDULER:INFO}
+    org.telegram: ${LOG_LEVEL_TELEGRAM:WARN}
+    com.zaxxer.hikari: ${LOG_LEVEL_HIKARI:WARN}
+    org.springframework: ${LOG_LEVEL_SPRING:WARN}
+    # SQL 日志（mapper 级别）
+    com.missav.bot.video.mapper: ${LOG_LEVEL_SQL:INFO}
+    com.missav.bot.push.mapper: ${LOG_LEVEL_SQL:INFO}
+    com.missav.bot.subscription.mapper: ${LOG_LEVEL_SQL:INFO}
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+  file:
+    name: logs/missav-bot.log
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: when-authorized
+
+
+
+application-local.yaml.example
+server:
+  port: 9999
+
+spring:
+  application:
+    name: missav-bot
+
+  sql:
+    init:
+      mode: never
+
+  datasource:
+    url: jdbc:mysql://localhost:3306/missav_bot?useSSL=false&serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=UTF-8&allowPublicKeyRetrieval=true
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: root
+    password: 123456
+
+# MyBatis-Plus配置
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# Telegram Bot配置
+telegram:
+  bot:
+    token: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+    username: @hello_world_missav_Bot
+    default-chat-id: 8077023887
+
+# 爬虫配置
+crawler:
+  enabled: true
+  interval: 900000
+  initial-pages: 2
+  user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+
+# 日志配置
+logging:
+  level:
+    root: INFO
+    com.missav.bot: DEBUG
+    org.telegram: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+  file:
+    name: logs/missav-bot.log
+
+
+
+pom.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.5</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.missav</groupId>
+    <artifactId>missav-bot</artifactId>
+    <version>1.0.0</version>
+    <name>missav-bot</name>
+    <description>Telegram Bot for MissAV video notifications</description>
+
+    <properties>
+        <java.version>21</java.version>
+        <telegram-bots.version>6.9.7.1</telegram-bots.version>
+        <mybatis-plus.version>3.5.9</mybatis-plus.version>
+        <maven.build.timestamp.format>yyyyMMddHHmmss</maven.build.timestamp.format>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Boot -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!-- MyBatis-Plus -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-boot-starter</artifactId>
+            <version>${mybatis-plus.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.mybatis</groupId>
+                    <artifactId>mybatis-spring</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.mybatis</groupId>
+            <artifactId>mybatis-spring</artifactId>
+            <version>3.0.3</version>
+        </dependency>
+
+        <!-- Telegram Bot -->
+        <dependency>
+            <groupId>org.telegram</groupId>
+            <artifactId>telegrambots</artifactId>
+            <version>${telegram-bots.version}</version>
+        </dependency>
+
+        <!-- Web Crawler -->
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>1.17.2</version>
+        </dependency>
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+            <version>4.12.0</version>
+        </dependency>
+        <dependency>
+            <groupId>org.seleniumhq.selenium</groupId>
+            <artifactId>selenium-java</artifactId>
+            <version>4.27.0</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.bonigarcia</groupId>
+            <artifactId>webdrivermanager</artifactId>
+            <version>5.9.2</version>
+        </dependency>
+
+        <!-- Database -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Utilities -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <version>33.0.0-jre</version>
+        </dependency>
+
+        <!-- Test -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>missav_bot_${maven.build.timestamp}</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <encoding>UTF-8</encoding>
+                    <fork>true</fork>
+                    <meminitial>128m</meminitial>
+                    <maxmem>512m</maxmem>
+                    <compilerArgs>
+                        <arg>-J-Duser.language=en</arg>
+                        <arg>-J-Duser.country=US</arg>
+                        <arg>-J-Dfile.encoding=UTF-8</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.1.2</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.3.0</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.3.1</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-clean-plugin</artifactId>
+                <version>3.2.0</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-install-plugin</artifactId>
+                <version>3.1.1</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-deploy-plugin</artifactId>
+                <version>3.1.1</version>
+            </plugin>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
