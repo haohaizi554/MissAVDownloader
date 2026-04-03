@@ -2,6 +2,7 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import os
+import sys  # 添加缺失的导入
 import time
 import subprocess
 import re
@@ -10,6 +11,8 @@ import shutil
 import urllib.parse
 from collections import defaultdict
 from playwright.sync_api import sync_playwright
+import cloudscraper  # 导入cloudscraper库用于解决Cloudflare拦截
+
 # ================= 🎨 UI 主题配置 =================
 THEME = {
     "bg": "#1A1A1A", "card_bg": "#252525", "accent": "#3B8ED0", 
@@ -327,10 +330,79 @@ class MissAVDownloaderApp(ctk.CTk):
         verified_chinese_urls = set()
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=False, proxy={"server": proxy_server} if proxy_server else None, args=['--disable-blink-features=AutomationControlled'])
-                context = browser.new_context(user_agent=my_ua)
-                page = context.new_page()                
-                page.goto(target_url, timeout=60000)                
+                # 启动浏览器时添加更多反检测参数
+                browser = p.chromium.launch(
+                    headless=False, 
+                    proxy={"server": proxy_server} if proxy_port else None, 
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-dev-shm-usage',
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-accelerated-2d-canvas',
+                        '--no-first-run',
+                        '--no-default-browser-check',
+                        '--disable-extensions',
+                        '--disable-features=VizDisplayCompositor',
+                        '--disable-web-security',
+                        '--allow-running-insecure-content',
+                        '--disable-features=CrossSiteDocumentBlockingIfIsolatin'
+                    ]
+                )
+                # 创建上下文时添加更多模拟真实用户的行为
+                context = browser.new_context(
+                    user_agent=my_ua,
+                    viewport={'width': 1920, 'height': 1080},
+                    locale='zh-CN',
+                    timezone_id='Asia/Shanghai',
+                    extra_http_headers={
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                        'Cache-Control': 'no-cache',
+                        'Pragma': 'no-cache'
+                    }
+                )
+                # 添加一些navigator属性覆盖，使其看起来不像自动化工具
+                context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined,
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5],
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['zh-CN', 'zh', 'en'],
+                    });
+                """)
+                page = context.new_page()
+                
+                # 首次访问目标URL
+                page.goto(target_url, timeout=60000)
+                
+                # 等待页面加载
+                time.sleep(2)
+                
+                # 模拟人类滚动行为
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight/4);")
+                time.sleep(1)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight/3);")
+                time.sleep(1)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight/2);")
+                time.sleep(2)
+                
+                # 检查是否被Cloudflare拦截
+                if "Just a moment..." in page.title() or "Checking your browser before accessing" in page.content() or "Ray ID:" in page.content():
+                    self.log("   ⚠️ 检测到Cloudflare防护，尝试绕过...")
+                    # 尝试使用cloudscraper绕过
+                    scraper = self.bypass_cloudflare_with_scraper(target_url, my_ua)
+                    if scraper:
+                        self.log("   ✅ Cloudflare绕过成功")
+                        # 继续等待页面加载
+                        time.sleep(10)
+                    else:
+                        self.log("   ⚠️ Cloudflare绕过失败，继续等待")
+                        time.sleep(10)
+                
                 # 1. 智能导航
                 if is_search_mode:
                     self.log("⏳ 等待搜索结果...")
@@ -361,6 +433,17 @@ class MissAVDownloaderApp(ctk.CTk):
                         target_url = f"{current_url}{sep}filters=individual"
                         self.log(f"🔄 切换单体模式: {target_url}")
                         page.goto(target_url, timeout=60000)
+                        
+                        # 检查切换页面是否也被拦截
+                        if "Just a moment..." in page.title() or "Checking your browser before accessing" in page.content():
+                            self.log("   ⚠️ 检测到Cloudflare防护，尝试绕过...")
+                            scraper = self.bypass_cloudflare_with_scraper(target_url, my_ua)
+                            if scraper:
+                                self.log("   ✅ Cloudflare绕过成功")
+                                time.sleep(10)
+                            else:
+                                self.log("   ⚠️ Cloudflare绕过失败，继续等待")
+                                time.sleep(10)
                     else:
                         target_url = page.url                
                 base_url_main = target_url
@@ -376,7 +459,20 @@ class MissAVDownloaderApp(ctk.CTk):
                         page_url = f"{base_url_main}{sep}page={current_page}"
                     self.log(f"📄 扫描第 {current_page} 页...")
                     try:
-                        if current_page > 1: page.goto(page_url, timeout=60000)
+                        if current_page > 1: 
+                            page.goto(page_url, timeout=60000)
+                            
+                            # 检查翻页是否被拦截
+                            if "Just a moment..." in page.title() or "Checking your browser before accessing" in page.content():
+                                self.log("   ⚠️ 检测到Cloudflare防护，尝试绕过...")
+                                scraper = self.bypass_cloudflare_with_scraper(page_url, my_ua)
+                                if scraper:
+                                    self.log("   ✅ Cloudflare绕过成功")
+                                    time.sleep(10)
+                                else:
+                                    self.log("   ⚠️ Cloudflare绕过失败，继续等待")
+                                    time.sleep(10)
+                        
                         page.wait_for_selector("div.grid", timeout=10000)
                     except:
                         self.log("⚠️ 主列表扫描结束。")
@@ -439,6 +535,18 @@ class MissAVDownloaderApp(ctk.CTk):
                         self.log(f"📄 校验第 {current_page} 页...")
                         try:
                             page.goto(page_url, timeout=60000)
+                            
+                            # 检查中文校验页面是否被拦截
+                            if "Just a moment..." in page.title() or "Checking your browser before accessing" in page.content():
+                                self.log("   ⚠️ 检测到Cloudflare防护，尝试绕过...")
+                                scraper = self.bypass_cloudflare_with_scraper(page_url, my_ua)
+                                if scraper:
+                                    self.log("   ✅ Cloudflare绕过成功")
+                                    time.sleep(10)
+                                else:
+                                    self.log("   ⚠️ Cloudflare绕过失败，继续等待")
+                                    time.sleep(10)
+                            
                             page.wait_for_selector("div.grid", timeout=10000)
                         except:
                             self.log("⚠️ 中文列表扫描结束。")
@@ -514,15 +622,55 @@ class MissAVDownloaderApp(ctk.CTk):
                 except: pass
             if not self.check_disk_space(current_save_dir): break
             current_save_dir = self.entry_save.get().strip()            
-            self.log(f"\n🎬 [{i+1}/{len(final_list)}] 处理: {self.clean_code(url)}")
-            self.download_single(url, title_text, current_save_dir, proxy_server, my_ua, verified_chinese_urls)
+            
+            # 在下载前检查本地文件是否存在
+            code_name = self.clean_code(url) or "UNKNOWN"
+            safe_title = "".join([c for c in (title_text or "") if c not in r'\/:*?"<>|']).strip()
+            
+            # 获取视频的完整信息以确定文件名
+            is_uncensored = "uncensored" in url.lower() or "leak" in url.lower() or "无码" in title_text.lower()
+            is_chinese = (url in verified_chinese_urls) or ("chinese" in url.lower()) or ("中文字幕" in title_text.lower())
+            if is_uncensored: is_chinese = False
+            is_english = "english" in url.lower() or "英文字幕" in title_text.lower()
+            
+            suffix = ""
+            if is_chinese: suffix = " [中文字幕]"
+            elif is_english: suffix = " [英文字幕]"
+            elif is_uncensored: suffix = " [无码]"
+            
+            if code_name in safe_title.upper():
+                file_name = f"{safe_title}{suffix}"
+            else:
+                file_name = f"{code_name} {safe_title}{suffix}"
+            if len(file_name) > 220: file_name = file_name[:220]
+            
+            # 检查文件是否已存在
+            video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.f4v']
+            existing_file = None
+            for ext in video_extensions:
+                full_path = os.path.join(current_save_dir, file_name + ext)
+                if os.path.exists(full_path):
+                    existing_file = full_path
+                    break
+            
+            if existing_file:
+                self.log(f"\n🎬 [{i+1}/{len(final_list)}] {self.clean_code(url)} - 文件已存在，跳过: {os.path.basename(existing_file)}")
+                continue  # 跳过本次下载
+            else:
+                self.log(f"\n🎬 [{i+1}/{len(final_list)}] 处理: {self.clean_code(url)}")
+                self.download_single(url, title_text, current_save_dir, proxy_server, my_ua, verified_chinese_urls)
             for _ in range(3):
                 if self.stop_event.is_set(): break
                 time.sleep(1)
         self.log("\n🎉 任务结束！")
         self.reset_ui()
+
     def download_single(self, url, original_title, save_dir, proxy, ua, verified_chinese_urls):
+        import tempfile
+        import uuid
         code_name = self.clean_code(url) or "UNKNOWN"
+        # 初始化 safe_title，确保在所有路径中都定义
+        safe_title = "".join([c for c in (original_title or "") if c not in r'\/:*?"<>|']).strip()
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=False, proxy={"server": proxy} if proxy else None, args=['--disable-blink-features=AutomationControlled'])
@@ -545,18 +693,35 @@ class MissAVDownloaderApp(ctk.CTk):
                 page_title = page.title().replace("| MissAV", "").strip()
                 if not page_title: page_title = original_title
                 safe_title = "".join([c for c in page_title if c not in r'\/:*?"<>|']).strip()
-                if "Just a moment" in page.title():
+                
+                # 检查是否被Cloudflare拦截
+                if "Just a moment..." in page.title() or "Checking your browser before accessing" in page.content():
+                    self.log("   ⚠️ 检测到Cloudflare防护，尝试绕过...")
+                    # 尝试使用cloudscraper绕过
+                    scraper = self.bypass_cloudflare_with_scraper(url, ua)
+                    if scraper:
+                        self.log("   ✅ Cloudflare绕过成功")
+                        # 继续等待页面加载
+                        time.sleep(10)
+                    else:
+                        self.log("   ⚠️ Cloudflare绕过失败，继续等待")
+                        time.sleep(10)
+                elif "Just a moment" in page.title():
                     self.log("   ⚠️ 触发验证，等待 10s...")
-                    time.sleep(10)                
+                    time.sleep(10)
+                
+                # 确保页面已加载
                 try:
                     page.wait_for_selector(".plyr", timeout=5000)
                     page.mouse.click(400, 300)
                     time.sleep(2)
                     if not final_url: page.mouse.click(400, 300)
-                except: pass                
+                except: pass
+                
                 for _ in range(15):
                     if final_url: break
-                    time.sleep(1)                
+                    time.sleep(1)
+                
                 browser.close()               
                 if final_url:
                     is_uncensored = "uncensored" in url.lower() or "leak" in url.lower() or "无码" in original_title.lower()
@@ -571,18 +736,100 @@ class MissAVDownloaderApp(ctk.CTk):
                         file_name = f"{safe_title}{suffix}"
                     else:
                         file_name = f"{code_name} {safe_title}{suffix}"
-                    if len(file_name) > 220: file_name = file_name[:220]                    
-                    self.log(f"   ⚡ 启动外部下载器: {file_name}")                   
-                    cmd = ["N_m3u8DL-RE.exe", final_url, "--save-dir", save_dir, "--save-name", file_name, "--thread-count", "16", "--download-retry-count", "10", "--auto-select", "true", "--header", f"User-Agent: {ua}", "--header", f"Referer: {url}", "--mux-after-done", "format=mp4", "--no-log"]                   
+                    if len(file_name) > 220: file_name = file_name[:220]
+                    
+                    # 再次检查文件是否已存在（双重保险）
+                    video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.f4v']
+                    existing_file = None
+                    for ext in video_extensions:
+                        full_path = os.path.join(save_dir, file_name + ext)
+                        if os.path.exists(full_path):
+                            existing_file = full_path
+                            break
+                    
+                    if existing_file:
+                        self.log(f"   ⚠️ 文件已存在，跳过下载: {os.path.basename(existing_file)}")
+                        return
+                    
+                    # 使用临时文件名以避免在下载窗口中显示真实文件名
+                    temp_filename = f"temp_video_{uuid.uuid4().hex[:8]}"
+                    self.log(f"   ⚡ 启动外部下载器: {file_name}")
+                    
+                    cmd = ["N_m3u8DL-RE.exe", final_url, "--save-dir", save_dir, "--save-name", temp_filename, "--thread-count", "16", "--download-retry-count", "10", "--auto-select", "true", "--header", f"User-Agent: {ua}", "--header", f"Referer: {url}", "--no-log"]
+                    
                     process = subprocess.run(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
-                    if process.returncode == 0: self.log("   ✅ 下载成功")
-                    else: self.log("   ❌ 下载失败")
+                    
+                    # 检查下载是否成功
+                    if process.returncode == 0:
+                        # 寻找临时文件
+                        temp_files = []
+                        for ext in ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.f4v']:
+                            temp_path = os.path.join(save_dir, temp_filename + ext)
+                            if os.path.exists(temp_path):
+                                temp_files.append(temp_path)
+                        
+                        if temp_files:
+                            # 将临时文件重命名为真实文件名
+                            temp_file = temp_files[0]
+                            final_path = os.path.join(save_dir, file_name + os.path.splitext(temp_file)[1])
+                            
+                            # 确保最终文件名也不存在
+                            if os.path.exists(final_path):
+                                self.log(f"   ⚠️ 最终文件已存在，跳过重命名: {os.path.basename(final_path)}")
+                            else:
+                                os.rename(temp_file, final_path)
+                                self.log("   ✅ 下载成功")
+                        else:
+                            self.log("   ❌ 下载失败，找不到临时文件")
+                    else:
+                        self.log("   ❌ 下载失败")
                 else: self.log("   ❌ 无法获取视频链接")
         except Exception as e: self.log(f"   ❌ 异常: {e}")
+
     def reset_ui(self):
         self.is_running = False
         self.btn_start.configure(state="normal", text="🚀 立即执行", fg_color=THEME["success"])
         self.btn_stop.configure(state="disabled")
+
+    def bypass_cloudflare_with_scraper(self, url, ua):
+        """使用cloudscraper绕过Cloudflare验证"""
+        try:
+            # 创建带各种选项的scraper实例
+            scraper = cloudscraper.create_scraper(
+                browser={
+                    'browser': 'chrome',
+                    'platform': 'windows',
+                    'mobile': False
+                },
+                # 启用各种反机器人绕过技术
+                disableJavaScript=False,
+                # 设置超时时间
+                timeout=30
+            )
+            
+            headers = {
+                'User-Agent': ua,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'zh-CN,zh;q=0.8,en-US;q=0.5,en;q=0.3',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Cache-Control': 'max-age=0'
+            }
+            
+            # 尝试获取页面内容
+            response = scraper.get(url, headers=headers)
+            
+            # 如果请求成功，返回scraper对象
+            return scraper if response.status_code == 200 else None
+        except Exception as e:
+            self.log(f"   ❌ Cloudflare绕过失败: {e}")
+            return None
+
+# 启动应用程序
 if __name__ == "__main__":
     app = MissAVDownloaderApp()
     app.mainloop()
