@@ -4,10 +4,11 @@
 ![UI](https://img.shields.io/badge/UI-CustomTkinter-green)
 ![Status](https://img.shields.io/badge/Status-Active-brightgreen)
 
-本项目今后将很少维护，会将相关业务合并到 https://github.com/haohaizi554/UniversalCrawler
 这是一个基于 Python 的桌面端视频下载工具，专为 MissAV 设计。它结合了 **Playwright** 的自动化嗅探能力和 **N_m3u8DL-RE** 的强大下载能力，封装在一个现代化的 GUI 界面中。
 
 本项目针对 **“便携化”** 和 **“打包发布”** 进行了特殊优化，支持将浏览器内核与执行文件打包在一起，实现开箱即用，无需用户手动安装复杂的环境。
+
+本项目今后将很少维护，会将相关业务合并到 https://github.com/haohaizi554/UniversalCrawler
 
 ## 📊 工作流程图
 
